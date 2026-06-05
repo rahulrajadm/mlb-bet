@@ -170,7 +170,10 @@ def picks_table(pick_list, max_rows=50, show_context=False):
                   "HIGH":   "background-color:#ef4444;color:#fff"}
         return colors.get(val, "")
 
-    styled = df.style.applymap(color_conf, subset=["Confidence"]).applymap(color_risk, subset=["Risk"])
+    style_fn = df.style.map if hasattr(df.style, "map") else df.style.applymap
+    styled = style_fn(color_conf, subset=["Confidence"])
+    style_fn2 = styled.map if hasattr(styled, "map") else styled.applymap
+    styled = style_fn2(color_risk, subset=["Risk"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
