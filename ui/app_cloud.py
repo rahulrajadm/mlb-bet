@@ -122,6 +122,7 @@ with st.sidebar:
         st.success("✅ Lineups confirmed")
     else:
         st.warning("⏳ Lineups not posted yet")
+    st.caption(f"🕐 Last updated: **{data['fetched_at']}** CT")
     st.caption("Data: PrizePicks · Underdog · MLB Stats API")
 
 # Timestamp banner — shown at top of every tab
