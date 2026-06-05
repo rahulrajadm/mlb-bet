@@ -31,7 +31,7 @@ st.set_page_config(
 
 # ── In-memory data loading (cached) ───────────────────────────────────────────
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_all_data():
     """Fetch all live data in-memory. Cached for 30 minutes."""
     games       = fetch_today_schedule()
@@ -138,7 +138,7 @@ def timestamp_bar(fetched_at: str):
 # Build picks from in-memory data
 TIER_RANK = {"STRONG": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_picks_cloud(bankroll, unit_size, min_conf, _platforms, _cache_key):
     all_picks = build_picks(
         bankroll=bankroll,
