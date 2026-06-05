@@ -13,6 +13,11 @@ __pycache__/
 dist/
 build/
 
+# Personal tracking files
+*.xlsx
+*.xls
+*.csv
+
 # OS
 .DS_Store
 
