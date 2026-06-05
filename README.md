@@ -8,7 +8,7 @@ Built for Texas-legal pick'em and prediction market platforms: **PrizePicks, Und
 
 ## Live Demo
 
-🚀 **[mlb-bet.streamlit.app](https://mlb-bet.streamlit.app)**
+🚀 **[bet-mlb.streamlit.app](https://bet-mlb.streamlit.app)**
 
 ---
 
