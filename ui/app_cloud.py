@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from pipeline.schedule import fetch_today_schedule
 from pipeline.prizepicks import fetch_mlb_lines as pp_fetch
@@ -71,7 +72,7 @@ def load_all_data():
         "pit_stats": pit_stats,
         "hand_db":   hand_db,
         "confirmed": confirmed,
-        "fetched_at": datetime.now(timezone.utc).strftime("%b %d %Y, %I:%M %p UTC"),
+        "fetched_at": datetime.now(ZoneInfo("America/Chicago")).strftime("%b %d %Y, %I:%M %p"),
     }
 
 
@@ -121,8 +122,11 @@ with st.sidebar:
         st.success("✅ Lineups confirmed")
     else:
         st.warning("⏳ Lineups not posted yet")
-    st.caption(f"Last refreshed: {data['fetched_at']}")
     st.caption("Data: PrizePicks · Underdog · MLB Stats API")
+
+# Timestamp banner — shown at top of every tab
+def timestamp_bar(fetched_at: str):
+    st.info(f"🕐 Data last updated: **{fetched_at}** (CT)  —  Hit Refresh in the sidebar to update.", icon=None)
 
 # Build picks from in-memory data
 TIER_RANK = {"STRONG": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
@@ -219,6 +223,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ── Tab 1: High Interest ───────────────────────────────────────────────────────
 
 with tab1:
+    timestamp_bar(data["fetched_at"])
     st.header("🔥 High Interest Picks")
     st.caption(
         "Competitive lines only — ≥1.0 line, or More on a contested 0.5 stat. "
@@ -245,6 +250,7 @@ with tab1:
 # ── Tab 2: Today's Picks ───────────────────────────────────────────────────────
 
 with tab2:
+    timestamp_bar(data["fetched_at"])
     st.header("Today's Picks")
     st.caption("All +EV picks. Use 🔥 High Interest for competitive lines only.")
     c1, c2, c3, c4 = st.columns(4)
@@ -258,6 +264,7 @@ with tab2:
 # ── Tab 3: Game Predictions ────────────────────────────────────────────────────
 
 with tab3:
+    timestamp_bar(data["fetched_at"])
     st.header("Today's Games")
     if not games_list:
         st.info("No games found for today.")
@@ -288,6 +295,7 @@ with tab3:
 # ── Tab 4: Player Props ────────────────────────────────────────────────────────
 
 with tab4:
+    timestamp_bar(data["fetched_at"])
     st.header("Player Props — Platform Comparison")
     search     = st.text_input("Search player name…", "")
     hi_comp    = platform_comparison(hi)
