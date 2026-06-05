@@ -175,6 +175,7 @@ def picks_table(pick_list, max_rows=75, show_context=False):
             row["Season Rate"] = f"{p.get('season_rate', 0):.2f}" if p.get("season_rate") is not None else "—"
             row["Recent Rate"] = f"{p.get('recent_rate', 0):.2f}" if p.get("recent_rate") is not None else "—"
             row["Matchup"]     = p.get("matchup", "—")
+            row["Arsenal"]     = p.get("arsenal", "—")
             row["Park"]        = p.get("park", "—")
             row["Platoon"]     = p.get("platoon", "—")
         rows.append(row)

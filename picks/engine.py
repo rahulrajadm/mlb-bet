@@ -124,6 +124,7 @@ def build_picks(
             "recent_rate":       pred.get("recent_rate"),
             "form_source":       pred.get("form_source", ""),
             "matchup":           pred.get("matchup", ""),
+            "arsenal":           pred.get("arsenal", ""),
             "park":              pred.get("park", ""),
             "platoon":           pred.get("platoon", ""),
         })

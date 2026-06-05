@@ -22,6 +22,7 @@ from pipeline.lineups import get_confirmed_players, lineups_are_posted
 from pipeline.pitcher_stats import lookup_pitcher
 from pipeline.park_factors import apply_park_factor
 from pipeline.handedness import load_handedness_from_db, get_platoon_adj
+from pipeline.pitcher_arsenal import load_arsenal_from_db, lookup_arsenal
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../data/models")
 
@@ -221,6 +222,7 @@ def predict_props(
 
     pitcher_stats = pitcher_stats_data if pitcher_stats_data is not None else load_pitcher_season_stats()
     handedness_db = handedness_data if handedness_data is not None else load_handedness_from_db()
+    arsenal_db    = load_arsenal_from_db()
 
     if games_data is not None:
         games = pd.DataFrame(games_data)
@@ -272,51 +274,86 @@ def predict_props(
         if lineups_posted and confirmed_players and player_name not in confirmed_players:
             continue
 
-        # Season rate
-        season_rate = get_season_rate(player_name, stat_col, batters, pitchers)
-        if season_rate is None:
-            continue
+        is_pitcher_prop = row["stat_type"] in PITCHER_PROP_STATS
+        player_team     = row.get("player_team", "")
 
-        # Recent form rate
-        recent_rate = get_recent_rate(player_name, stat_col, recent_batting, recent_pitching)
+        # For pitcher props: derive rate directly from pitcher stats (bypasses batter profile lookup)
+        if is_pitcher_prop:
+            pitcher_info = lookup_pitcher(player_name, pitcher_stats)
+            blended_rate = pitcher_info["blended_k_gs"]
+            season_rate  = pitcher_info["k_per_gs"]
+            recent_k     = pitcher_info.get("recent_k_gs")
+            recent_rate  = recent_k
+            form_source  = "blended_pitcher" if recent_k else "season_only"
 
-        # Blend: recent form + season average
-        if recent_rate is not None:
-            blended_rate = RECENT_WEIGHT * recent_rate + SEASON_WEIGHT * season_rate
-            form_source  = "blended"
+            if blended_rate <= 0:
+                continue
+
+            opp_pitcher  = "TBD"
+            k_adj        = 1.0
+            matchup_note = f"K/GS: season={season_rate:.1f}" + (f" recent={recent_k:.1f}" if recent_k else "")
+            arsenal_note = ""
+
+            # Arsenal adjustment: pitcher's own whiff rate vs league avg
+            arsenal_info  = lookup_arsenal(player_name, arsenal_db)
+            arsenal_adj   = arsenal_info["arsenal_adj"]
+            blended_rate  = blended_rate * arsenal_adj
+            arsenal_note  = f"whiff={arsenal_info['arsenal_whiff_pct']:.1f}% adj={arsenal_adj:.2f}x"
+
         else:
-            blended_rate = season_rate
-            form_source  = "season_only"
+            # Batter props: use historical profiles
+            season_rate = get_season_rate(player_name, stat_col, batters, pitchers)
+            if season_rate is None:
+                continue
 
-        player_team = row.get("player_team", "")
+            recent_rate = get_recent_rate(player_name, stat_col, recent_batting, recent_pitching)
 
-        # 3. Pitcher matchup adjustment (batter stats only)
-        opp_pitcher  = "TBD"
-        k_adj        = 1.0
-        matchup_note = "no_adj"
-        if stat_col in PITCHER_ADJ_BATTER_STATS and not games.empty:
-            opp_pitcher = get_opponent_pitcher(player_team, games)
-            if opp_pitcher and opp_pitcher != "TBD":
-                pitcher_info = lookup_pitcher(opp_pitcher, pitcher_stats)
-                k_adj        = pitcher_info["k_adj"]
-                blended_rate = apply_pitcher_matchup(blended_rate, stat_col, k_adj)
-                matchup_note = f"vs {opp_pitcher} (k_adj={k_adj:.2f})"
+            if recent_rate is not None:
+                blended_rate = RECENT_WEIGHT * recent_rate + SEASON_WEIGHT * season_rate
+                form_source  = "blended"
+            else:
+                blended_rate = season_rate
+                form_source  = "season_only"
+
+        # 3. Pitcher matchup + arsenal (batter stats only — pitcher props handled above)
+        opp_pitcher  = opp_pitcher  if is_pitcher_prop else "TBD"
+        k_adj        = k_adj        if is_pitcher_prop else 1.0
+        matchup_note = matchup_note if is_pitcher_prop else "no_adj"
+        arsenal_note = arsenal_note if is_pitcher_prop else ""
+
+        if not is_pitcher_prop and not games.empty and stat_col in PITCHER_ADJ_BATTER_STATS:
+                # For batter stats: adjust based on opposing pitcher
+                opp_pitcher  = get_opponent_pitcher(player_team, games)
+                if opp_pitcher and opp_pitcher != "TBD":
+                    pitcher_info = lookup_pitcher(opp_pitcher, pitcher_stats)
+                    k_adj        = pitcher_info["k_adj"]
+                    blended_rate = apply_pitcher_matchup(blended_rate, stat_col, k_adj)
+
+                    # Arsenal adjustment on batter: high-whiff pitcher → harder to hit
+                    arsenal_info = lookup_arsenal(opp_pitcher, arsenal_db)
+                    if arsenal_info["arsenal_adj"] != 1.0 and stat_col in PITCHER_ADJ_BATTER_STATS:
+                        arsenal_mult = 1.0 - 0.3 * (arsenal_info["arsenal_adj"] - 1.0)
+                        blended_rate = max(blended_rate * arsenal_mult, 0.0)
+                        arsenal_note = f"arsenal_adj={arsenal_info['arsenal_adj']:.2f}x"
+
+                    matchup_note = f"vs {opp_pitcher} (k_adj={k_adj:.2f})"
 
         # 4. Park factor adjustment
-        venue      = venue_map.get(player_team, "")
-        park_note  = venue if venue else "avg"
+        venue        = venue_map.get(player_team, "")
+        park_note    = venue if venue else "avg"
         blended_rate = apply_park_factor(blended_rate, stat_col, venue)
 
-        # 5. Platoon adjustment (batter hand vs pitcher hand)
+        # 5. Platoon adjustment (batter hand vs pitcher hand, batter props only)
         platoon_note = ""
-        player_info  = handedness_db.get(player_name, {})
-        bat_side     = player_info.get("bat_side", "")
-        pitcher_info_h = handedness_db.get(opp_pitcher, {})
-        pitch_hand   = pitcher_info_h.get("pitch_hand", "")
-        if bat_side and pitch_hand:
-            platoon_mult = get_platoon_adj(bat_side, pitch_hand, stat_col)
-            blended_rate = max(blended_rate * platoon_mult, 0.0)
-            platoon_note = f"{bat_side}HB vs {pitch_hand}HP ({platoon_mult:.3f}x)"
+        if not is_pitcher_prop:
+            player_info    = handedness_db.get(player_name, {})
+            bat_side       = player_info.get("bat_side", "")
+            pitcher_info_h = handedness_db.get(opp_pitcher, {})
+            pitch_hand     = pitcher_info_h.get("pitch_hand", "")
+            if bat_side and pitch_hand:
+                platoon_mult = get_platoon_adj(bat_side, pitch_hand, stat_col)
+                blended_rate = max(blended_rate * platoon_mult, 0.0)
+                platoon_note = f"{bat_side}HB vs {pitch_hand}HP ({platoon_mult:.3f}x)"
 
         if blended_rate <= 0:
             continue
@@ -355,6 +392,7 @@ def predict_props(
             "recent_rate":   round(recent_rate, 3) if recent_rate is not None else None,
             "form_source":   form_source,
             "matchup":       matchup_note,
+            "arsenal":       arsenal_note,
             "park":          park_note,
             "platoon":       platoon_note,
             "game_id":       row.get("game_id", ""),
