@@ -127,7 +127,13 @@ with st.sidebar:
 
 # Timestamp banner — shown at top of every tab
 def timestamp_bar(fetched_at: str):
-    st.info(f"🕐 Data last updated: **{fetched_at}** (CT)  —  Hit Refresh in the sidebar to update.", icon=None)
+    st.markdown(
+        f"<div style='background:#1a1d27;border-left:3px solid #22c55e;padding:8px 14px;"
+        f"border-radius:4px;font-size:0.85rem;color:#9ca3af;margin-bottom:8px'>"
+        f"🕐 Data last updated: <strong style='color:#e8eaf0'>{fetched_at} CT</strong>"
+        f" &nbsp;·&nbsp; Refresh in the sidebar to update</div>",
+        unsafe_allow_html=True,
+    )
 
 # Build picks from in-memory data
 TIER_RANK = {"STRONG": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
@@ -192,16 +198,16 @@ def picks_table(pick_list, max_rows=75, show_context=False):
     df = pd.DataFrame(rows)
 
     def color_conf(val):
-        colors = {"STRONG": "background-color:#22c55e;color:#000",
-                  "HIGH":   "background-color:#86efac;color:#000",
-                  "MEDIUM": "background-color:#fbbf24;color:#000",
-                  "LOW":    "background-color:#94a3b8;color:#000"}
+        colors = {"STRONG": "background-color:#16a34a;color:#fff;font-weight:700",
+                  "HIGH":   "background-color:#22c55e;color:#000;font-weight:700",
+                  "MEDIUM": "background-color:#ca8a04;color:#fff;font-weight:700",
+                  "LOW":    "background-color:#374151;color:#9ca3af;font-weight:700"}
         return colors.get(val, "")
 
     def color_risk(val):
-        colors = {"LOW":    "background-color:#22c55e;color:#000",
-                  "MEDIUM": "background-color:#f97316;color:#000",
-                  "HIGH":   "background-color:#ef4444;color:#fff"}
+        colors = {"LOW":    "background-color:#16a34a;color:#fff;font-weight:700",
+                  "MEDIUM": "background-color:#c2410c;color:#fff;font-weight:700",
+                  "HIGH":   "background-color:#dc2626;color:#fff;font-weight:700"}
         return colors.get(val, "")
 
     style_fn = df.style.map if hasattr(df.style, "map") else df.style.applymap
