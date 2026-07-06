@@ -1,6 +1,9 @@
 """
 Assembles model predictions + analysis into final structured pick objects.
 Filters to meaningful +EV picks, deduplicates cross-platform, ranks by EV.
+
+Public API: build_picks, best_picks_per_player, platform_comparison,
+is_high_interest, line_type_rows.
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
