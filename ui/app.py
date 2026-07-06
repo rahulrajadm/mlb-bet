@@ -9,7 +9,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
 
-from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest
+from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest, line_type_rows
 from pipeline.schedule import get_today_games
 from pipeline.prizepicks import get_prizepicks_lines
 from pipeline.underdog import get_underdog_lines
@@ -110,9 +110,21 @@ with st.sidebar:
         ["prizepicks", "underdog"],
         default=["prizepicks", "underdog"],
     )
+    line_type_labels = st.multiselect(
+        "Line type",
+        ["Standard", "Goblin", "Demon"],
+        default=["Standard"],
+        help="Only Standard lines are EV-priced. Goblins/demons are More-only "
+             "with payouts PrizePicks doesn't expose, so they show in Player "
+             "Props as view-only (line + P(More)), never as staked picks.",
+    )
 
     st.divider()
     st.caption("Data sources: PrizePicks · Underdog · MLB Stats API")
+
+LINE_TYPE_MAP = {"Standard": "standard", "Goblin": "goblin", "Demon": "demon"}
+selected_odds_types = {LINE_TYPE_MAP[l] for l in line_type_labels} or {"standard"}
+alt_odds_types = tuple(sorted(selected_odds_types - {"standard"}))
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 
@@ -121,12 +133,17 @@ def load_picks(bankroll, unit_size):
     return build_picks(bankroll=bankroll, unit_size=unit_size)
 
 @st.cache_data(ttl=300)
+def load_alt_lines(alt_types):
+    return line_type_rows(alt_types) if alt_types else []
+
+@st.cache_data(ttl=300)
 def load_games():
     return get_today_games()
 
 with st.spinner("Loading picks…"):
     all_picks = load_picks(bankroll, unit_size)
     games = load_games()
+    alt_rows = load_alt_lines(alt_odds_types)
 
 # Apply sidebar filters
 if platforms:
@@ -141,6 +158,58 @@ hi_pool = [p for p in filtered if is_high_interest(p)]
 best = best_picks_per_player(filtered)
 high_interest = best_picks_per_player(hi_pool)
 comparison = platform_comparison(hi_pool)
+
+ALT_BADGE = {"goblin": "🟢 Goblin", "demon": "🔴 Demon"}
+
+def render_player_props(std_comparison, alt_view, search):
+    """Player Props tab body: standard priced picks plus view-only
+    goblin/demon lines, grouped by (player, canonical stat)."""
+    alt_by_key = {}
+    for r in alt_view:
+        alt_by_key.setdefault((r["player_name"], r["stat_display"]), []).append(r)
+
+    keys = set(std_comparison) | set(alt_by_key)
+    if search:
+        keys = {k for k in keys if search.lower() in k[0].lower()}
+
+    def sort_key(k):
+        std = std_comparison.get(k, [])
+        return (1 if std else 0,
+                len({p["platform"] for p in std}),
+                max((p["edge"] for p in std), default=-1.0))
+
+    ordered = sorted(keys, key=sort_key, reverse=True)
+    if not ordered:
+        st.info("No props match your search.")
+        return
+
+    for key in ordered[:60]:
+        player, stat = key
+        std  = sorted(std_comparison.get(key, []), key=lambda x: x["edge"], reverse=True)
+        alts = sorted(alt_by_key.get(key, []),     key=lambda x: (x["odds_type"], x["line"]))
+        label = f"**{player}** — {stat}" + ("  ·  view-only" if alts and not std else "")
+        with st.expander(label, expanded=False):
+            if std:
+                st.dataframe(pd.DataFrame([{
+                    "Platform":   p["platform"],
+                    "Stat name":  p["stat_type"],
+                    "Line":       f"{p['line']:g}",
+                    "Pick":       p["direction"],
+                    "Model %":    f"{p['model_prob']:.1%}",
+                    "Edge":       f"{p['edge']:+.1%}",
+                    "EV/100":     f"{p['ev_per_100']:+.1f}",
+                    "Confidence": p["confidence_tier"],
+                    "Risk":       p["risk_profile"],
+                } for p in std]), width="stretch", hide_index=True)
+            if alts:
+                st.caption("Alt lines (view only — not EV-priced):")
+                st.dataframe(pd.DataFrame([{
+                    "Platform": a["platform"],
+                    "Type":     ALT_BADGE.get(a["odds_type"], a["odds_type"]),
+                    "Line":     f"{a['line']:g}",
+                    "Pick":     "More",
+                    "P(More)":  f"{a['model_prob']:.1%}",
+                } for a in alts]), width="stretch", hide_index=True)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
@@ -293,34 +362,14 @@ with tab4:
     st.header("Player Props — Platform Comparison")
     st.caption("Same player-prop shown across PrizePicks and Underdog side-by-side.")
 
+    show_standard = "standard" in selected_odds_types
+    if alt_odds_types:
+        st.caption("🟢 Goblin / 🔴 Demon lines are More-only and can't be EV-priced "
+                   "(PrizePicks hides their payout) — shown view-only as line + P(More).")
+
     search = st.text_input("Search player name…", "")
-
-    comp_items = list(comparison.items())
-    if search:
-        comp_items = [item for item in comp_items if search.lower() in item[0][0].lower()]
-    # Props offered on both platforms first, then by best edge
-    comp_items.sort(key=lambda item: (len({p["platform"] for p in item[1]}),
-                                      max(p["edge"] for p in item[1])), reverse=True)
-
-    if not comp_items:
-        st.info("No props match your search.")
-    else:
-        for (player, stat), platform_picks in comp_items[:50]:
-            platform_picks_sorted = sorted(platform_picks, key=lambda x: x["edge"], reverse=True)
-
-            with st.expander(f"**{player}** — {stat}", expanded=False):
-                rows = [{
-                    "Platform":   p["platform"],
-                    "Stat name":  p["stat_type"],
-                    "Line":       f"{p['line']:g}",
-                    "Pick":       p["direction"],
-                    "Model %":    f"{p['model_prob']:.1%}",
-                    "Edge":       f"{p['edge']:+.1%}",
-                    "EV/100":     f"{p['ev_per_100']:+.1f}",
-                    "Confidence": p["confidence_tier"],
-                    "Risk":       p["risk_profile"],
-                } for p in platform_picks_sorted]
-                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    alt_view = [r for r in alt_rows if (not platforms or r["platform"] in platforms)]
+    render_player_props(comparison if show_standard else {}, alt_view, search)
 
 # ── Tab 5: Bankroll Tracker ────────────────────────────────────────────────────
 

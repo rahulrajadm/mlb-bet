@@ -205,6 +205,7 @@ def predict_props(
     handedness_data: dict | None = None,
     confirmed_players_data: set | None = None,
     arsenal_data: pd.DataFrame | None = None,
+    odds_types: tuple[str, ...] = ("standard",),
 ) -> list[dict]:
     batters, pitchers = load_profiles()
 
@@ -284,7 +285,8 @@ def predict_props(
     predictions = []
     for _, row in lines.iterrows():
         stat_type = row["stat_type"]
-        if row.get("odds_type", "standard") != "standard":
+        row_odds_type = row.get("odds_type", "standard") or "standard"
+        if row_odds_type not in odds_types:
             counts["non_standard"] += 1
             continue
         if stat_type in UNMODELED_STATS:
@@ -384,17 +386,24 @@ def predict_props(
             continue
 
         p_more, p_less = prob_more_less(blended_rate, line)
-        breakeven = breakeven_prob(row["platform"])
 
-        if p_more >= p_less:
-            direction, model_prob = "More", p_more
+        if row_odds_type == "standard":
+            breakeven = breakeven_prob(row["platform"])
+            if p_more >= p_less:
+                direction, model_prob = "More", p_more
+            else:
+                direction, model_prob = "Less", p_less
+            edge = model_prob - breakeven
+            if edge <= 0:
+                counts["no_edge"] += 1
+                continue
+            implied_val, edge_val = round(breakeven, 4), round(edge, 4)
         else:
-            direction, model_prob = "Less", p_less
-        edge = model_prob - breakeven
-
-        if edge <= 0:
-            counts["no_edge"] += 1
-            continue
+            # Goblins/demons are More-only with a boosted/reduced payout that
+            # PrizePicks doesn't expose, so they can't be EV-priced. Surface
+            # the line + P(More) for viewing only — never staked (no edge).
+            direction, model_prob = "More", p_more
+            implied_val, edge_val = None, None
 
         counts["passed"] += 1
         predictions.append({
@@ -404,11 +413,12 @@ def predict_props(
             "stat_type":     stat_type,
             "stat_key":      stat_col,
             "stat_display":  STAT_DISPLAY.get(stat_col, stat_type),
+            "odds_type":     row_odds_type,
             "line":          line,
             "direction":     direction,
             "model_prob":    round(model_prob, 4),
-            "implied_prob":  round(breakeven, 4),
-            "edge":          round(edge, 4),
+            "implied_prob":  implied_val,
+            "edge":          edge_val,
             "expected_rate": round(blended_rate, 3),
             "season_rate":   round(season_rate, 3),
             "recent_rate":   round(recent_rate, 3) if recent_rate is not None else None,

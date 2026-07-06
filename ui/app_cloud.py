@@ -18,7 +18,7 @@ from pipeline.pitcher_arsenal import pull_arsenal_stats, compute_weighted_whiff
 from pipeline.handedness import fetch_lineup_handedness
 from pipeline.lineups import get_confirmed_players
 from pipeline.team_names import to_abbr, to_full_name
-from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest
+from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest, line_type_rows
 from analysis.confidence import TIER_RANK
 from analysis.ev import ev_slip
 from utils.dates import APP_TZ
@@ -118,6 +118,19 @@ with st.sidebar:
         ["prizepicks", "underdog"],
         default=["prizepicks", "underdog"],
     )
+    line_type_labels = st.multiselect(
+        "Line type",
+        ["Standard", "Goblin", "Demon"],
+        default=["Standard"],
+        help="Only Standard lines are EV-priced. Goblins/demons are More-only "
+             "with payouts PrizePicks doesn't expose, so they show in Player "
+             "Props as view-only (line + P(More)), never as staked picks.",
+    )
+
+LINE_TYPE_MAP = {"Standard": "standard", "Goblin": "goblin", "Demon": "demon"}
+selected_odds_types = {LINE_TYPE_MAP[l] for l in line_type_labels} or {"standard"}
+alt_odds_types = tuple(sorted(selected_odds_types - {"standard"}))
+ALT_BADGE = {"goblin": "🟢 Goblin", "demon": "🔴 Demon"}
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 
@@ -166,11 +179,74 @@ def load_picks_cloud(bankroll, unit_size, min_conf, platforms_key, cache_key):
     min_rank = TIER_RANK.get(min_conf, 1)
     return [p for p in filtered if TIER_RANK.get(p["confidence_tier"], 0) >= min_rank]
 
+# View-only goblin/demon rows. Like load_picks_cloud, EVERY argument must
+# participate in the cache key — alt_types and cache_key included — or the
+# line-type control would silently freeze.
+@st.cache_data(show_spinner=False)
+def load_alt_lines_cloud(alt_types, cache_key):
+    if not alt_types:
+        return []
+    return line_type_rows(
+        alt_types,
+        lines_data=data["lines"],
+        games_data=data["games"],
+        recent_batting_data=data["rec_bat"],
+        recent_pitching_data=data["rec_pit"],
+        pitcher_stats_data=data["pit_stats"],
+        handedness_data=data["hand_db"],
+        confirmed_players_data=data["confirmed"],
+        arsenal_data=data["arsenal"],
+    )
+
 filtered = load_picks_cloud(bankroll, unit_size, min_conf, tuple(platforms), data["fetched_at"])
 hi_pool  = [p for p in filtered if is_high_interest(p)]
 best     = best_picks_per_player(filtered)
 hi       = best_picks_per_player(hi_pool)
 comp     = platform_comparison(hi_pool)
+alt_rows = load_alt_lines_cloud(alt_odds_types, data["fetched_at"])
+
+def render_player_props(std_comparison, alt_view, search):
+    """Player Props tab body: standard priced picks plus view-only
+    goblin/demon lines, grouped by (player, canonical stat)."""
+    alt_by_key = {}
+    for r in alt_view:
+        alt_by_key.setdefault((r["player_name"], r["stat_display"]), []).append(r)
+
+    keys = set(std_comparison) | set(alt_by_key)
+    if search:
+        keys = {k for k in keys if search.lower() in k[0].lower()}
+
+    def sort_key(k):
+        std = std_comparison.get(k, [])
+        return (1 if std else 0,
+                len({p["platform"] for p in std}),
+                max((p["edge"] for p in std), default=-1.0))
+
+    ordered = sorted(keys, key=sort_key, reverse=True)
+    if not ordered:
+        st.info("No props match your search.")
+        return
+
+    for key in ordered[:60]:
+        player, stat = key
+        std  = sorted(std_comparison.get(key, []), key=lambda x: x["edge"], reverse=True)
+        alts = sorted(alt_by_key.get(key, []),     key=lambda x: (x["odds_type"], x["line"]))
+        label = f"**{player}** — {stat}" + ("  ·  view-only" if alts and not std else "")
+        with st.expander(label, expanded=False):
+            if std:
+                st.dataframe(pd.DataFrame([{
+                    "Platform": p["platform"], "Stat name": p["stat_type"],
+                    "Line": f"{p['line']:g}", "Pick": p["direction"],
+                    "Model %": f"{p['model_prob']:.1%}", "Edge": f"{p['edge']:+.1%}",
+                    "EV/100": f"{p['ev_per_100']:+.1f}",
+                    "Confidence": p["confidence_tier"], "Risk": p["risk_profile"],
+                } for p in std]), width="stretch", hide_index=True)
+            if alts:
+                st.caption("Alt lines (view only — not EV-priced):")
+                st.dataframe(pd.DataFrame([{
+                    "Platform": a["platform"], "Type": ALT_BADGE.get(a["odds_type"], a["odds_type"]),
+                    "Line": f"{a['line']:g}", "Pick": "More", "P(More)": f"{a['model_prob']:.1%}",
+                } for a in alts]), width="stretch", hide_index=True)
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -311,27 +387,13 @@ with tab3:
 with tab4:
     timestamp_bar(data["fetched_at"])
     st.header("Player Props — Platform Comparison")
-    search     = st.text_input("Search player name…", "")
-    comp_items = list(comp.items())
-    if search:
-        comp_items = [item for item in comp_items if search.lower() in item[0][0].lower()]
-    # Props offered on both platforms first, then by best edge
-    comp_items.sort(key=lambda item: (len({p["platform"] for p in item[1]}),
-                                      max(p["edge"] for p in item[1])), reverse=True)
-    if not comp_items:
-        st.info("No props match your search.")
-    else:
-        for (player, stat), picks_list in comp_items[:50]:
-            sorted_picks = sorted(picks_list, key=lambda x: x["edge"], reverse=True)
-            with st.expander(f"**{player}** — {stat}", expanded=False):
-                rows = [{
-                    "Platform": p["platform"], "Stat name": p["stat_type"],
-                    "Line": f"{p['line']:g}", "Pick": p["direction"],
-                    "Model %": f"{p['model_prob']:.1%}", "Edge": f"{p['edge']:+.1%}",
-                    "EV/100": f"{p['ev_per_100']:+.1f}",
-                    "Confidence": p["confidence_tier"], "Risk": p["risk_profile"],
-                } for p in sorted_picks]
-                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    show_standard = "standard" in selected_odds_types
+    if alt_odds_types:
+        st.caption("🟢 Goblin / 🔴 Demon lines are More-only and can't be EV-priced "
+                   "(PrizePicks hides their payout) — shown view-only as line + P(More).")
+    search   = st.text_input("Search player name…", "")
+    alt_view = [r for r in alt_rows if (not platforms or r["platform"] in platforms)]
+    render_player_props(comp if show_standard else {}, alt_view, search)
 
 # ── Tab 5: Bankroll Tracker ────────────────────────────────────────────────────
 

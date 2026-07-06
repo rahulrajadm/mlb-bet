@@ -100,6 +100,7 @@ def build_picks(
             "stat_type":       pred["stat_type"],
             "stat_key":        pred["stat_key"],
             "stat_display":    pred["stat_display"],
+            "odds_type":       pred.get("odds_type", "standard"),
             "line":            pred["line"],
             "direction":       pred["direction"],
             "selection":       f"{pred['player_name']} {pred['stat_display']} {pred['direction']} {pred['line']:g}",
@@ -127,6 +128,31 @@ def build_picks(
     picks.sort(key=lambda x: (TIER_RANK.get(x["confidence_tier"], 0), x["ev_per_100"]), reverse=True)
 
     return picks
+
+
+def line_type_rows(odds_types, **data_kwargs) -> list[dict]:
+    """View-only rows for non-standard line types (goblin/demon).
+
+    These can't be EV-priced — PrizePicks doesn't expose their payout
+    multiplier — so we surface line + P(More) only. They are never staked
+    and must never be mixed into build_picks' +EV output.
+    """
+    types = tuple(t for t in odds_types if t and t != "standard")
+    if not types:
+        return []
+    raw = predict_props(odds_types=types, **data_kwargs)
+    return [{
+        "platform":     p["platform"],
+        "player_name":  p["player_name"],
+        "player_team":  p.get("player_team", ""),
+        "stat_type":    p["stat_type"],
+        "stat_key":     p.get("stat_key"),
+        "stat_display": p.get("stat_display", p["stat_type"]),
+        "odds_type":    p.get("odds_type", "standard"),
+        "line":         p["line"],
+        "direction":    p["direction"],
+        "model_prob":   p["model_prob"],
+    } for p in raw if p.get("odds_type", "standard") in types]
 
 
 def _prop_key(pick: dict) -> tuple:
