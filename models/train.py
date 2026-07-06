@@ -6,16 +6,18 @@ Saves serialized player profiles to data/ for use by the prediction engine.
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import sqlite3
 import pandas as pd
 import numpy as np
 import joblib
-from utils.db import get_conn, DB_PATH
+from utils.db import get_conn
+from utils.names import clean_name
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../data/models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-SEASON_WEIGHTS = {2022: 0.15, 2023: 0.30, 2024: 0.55}
+# Recency weights over the seasons present in batter_game_logs
+# (kept in sync with pipeline/historical.py SEASONS)
+SEASON_WEIGHTS = {2024: 0.15, 2025: 0.30, 2026: 0.55}
 
 
 def load_batter_logs() -> pd.DataFrame:
@@ -24,6 +26,7 @@ def load_batter_logs() -> pd.DataFrame:
     conn.close()
     df = df[df["Lev"].str.startswith("Maj")].copy()
     df["season"] = df["season"].astype(int)
+    df["Name"] = df["Name"].map(clean_name)  # B-Ref names arrive mojibake'd
     return df
 
 
@@ -99,14 +102,13 @@ def build_batter_profiles(logs: pd.DataFrame, statcast: pd.DataFrame) -> pd.Data
             w = SEASON_WEIGHTS.get(season, 0.1)
             weighted_rows.append((w, row))
 
-        total_w = sum(w for w, _ in weighted_rows)
-        if total_w == 0:
-            continue
-
         blended = {}
         for col in rate_feature_cols:
-            val = sum(w * row[col] for w, row in weighted_rows if pd.notna(row.get(col))) / total_w
-            blended[col] = val
+            # Normalize by the weights actually present for THIS column, so a
+            # season with a missing value doesn't drag the average toward 0.
+            pairs = [(w, row[col]) for w, row in weighted_rows if pd.notna(row.get(col))]
+            col_w = sum(w for w, _ in pairs)
+            blended[col] = sum(w * v for w, v in pairs) / col_w if col_w > 0 else np.nan
 
         latest = grp.sort_values("season").iloc[-1]
         blended["Name"] = name
@@ -120,7 +122,7 @@ def build_batter_profiles(logs: pd.DataFrame, statcast: pd.DataFrame) -> pd.Data
     # Join Statcast quality indicators (latest season available)
     statcast_latest = statcast.sort_values("season").groupby("player_id").last().reset_index()
     statcast_latest["Name_clean"] = statcast_latest["name_raw"].apply(
-        lambda x: " ".join(reversed(x.split(", "))) if ", " in str(x) else str(x)
+        lambda x: clean_name(" ".join(reversed(x.split(", "))) if ", " in str(x) else str(x))
     )
 
     statcast_feats = statcast_latest[[
@@ -137,7 +139,7 @@ def build_pitcher_profiles(statcast_pitchers: pd.DataFrame) -> pd.DataFrame:
     K rate comes from Odds API game lines + external pitching data.
     """
     statcast_pitchers["Name_clean"] = statcast_pitchers["name_raw"].apply(
-        lambda x: " ".join(reversed(x.split(", "))) if ", " in str(x) else str(x)
+        lambda x: clean_name(" ".join(reversed(x.split(", "))) if ", " in str(x) else str(x))
     )
 
     pitcher_latest = statcast_pitchers.sort_values("season").groupby("Name_clean").last().reset_index()

@@ -13,6 +13,7 @@ import numpy as np
 import pybaseball as pb
 from datetime import date
 from utils.db import get_conn
+from utils.names import clean_name, make_lookup
 
 LEAGUE_AVG_WHIFF_PCT = 26.0   # MLB average weighted whiff rate ~2024
 MIN_PA               = 50     # minimum PA to include a pitch type
@@ -25,7 +26,7 @@ def pull_arsenal_stats(season: int = None) -> pd.DataFrame:
     df = pb.statcast_pitcher_arsenal_stats(season, minPA=MIN_PA)
     df.rename(columns={"last_name, first_name": "name_raw"}, inplace=True)
     df["Name"] = df["name_raw"].apply(
-        lambda x: " ".join(reversed(x.split(", "))) if ", " in str(x) else str(x)
+        lambda x: clean_name(" ".join(reversed(x.split(", "))) if ", " in str(x) else str(x))
     )
     return df
 
@@ -84,26 +85,28 @@ def load_arsenal_from_db() -> pd.DataFrame:
     return df
 
 
-def lookup_arsenal(pitcher_name: str, arsenal_df: pd.DataFrame) -> dict:
-    """Return arsenal stats for a pitcher, falling back to league average."""
-    default = {"arsenal_whiff_pct": LEAGUE_AVG_WHIFF_PCT, "arsenal_adj": 1.0, "avg_put_away": 18.0}
-    if arsenal_df.empty:
-        return default
+ARSENAL_DEFAULT = {"arsenal_whiff_pct": LEAGUE_AVG_WHIFF_PCT, "arsenal_adj": 1.0, "avg_put_away": 18.0}
 
-    name_lower = pitcher_name.lower()
-    match = arsenal_df[arsenal_df["Name"].str.lower() == name_lower]
-    if match.empty:
-        last = name_lower.split()[-1]
-        match = arsenal_df[arsenal_df["Name"].str.lower().str.contains(last, na=False)]
 
-    if not match.empty:
-        row = match.iloc[0]
+def make_arsenal_lookup(arsenal_df: pd.DataFrame):
+    """name → arsenal dict (league-average default). Build once per run."""
+    row_lookup = make_lookup(arsenal_df)
+
+    def lookup(pitcher_name: str) -> dict:
+        row = row_lookup(pitcher_name)
+        if row is None:
+            return dict(ARSENAL_DEFAULT)
         return {
             "arsenal_whiff_pct": float(row["arsenal_whiff_pct"]) if pd.notna(row["arsenal_whiff_pct"]) else LEAGUE_AVG_WHIFF_PCT,
             "arsenal_adj":       float(row["arsenal_adj"])       if pd.notna(row["arsenal_adj"])       else 1.0,
             "avg_put_away":      float(row["avg_put_away"])      if pd.notna(row["avg_put_away"])      else 18.0,
         }
-    return default
+
+    return lookup
+
+
+def lookup_arsenal(pitcher_name: str, arsenal_df: pd.DataFrame) -> dict:
+    return make_arsenal_lookup(arsenal_df)(pitcher_name)
 
 
 if __name__ == "__main__":

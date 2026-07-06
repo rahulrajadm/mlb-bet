@@ -1,36 +1,36 @@
 """
-Assigns a risk profile to each pick based on stat type variance and bet structure.
+Assigns a risk profile to each pick based on stat-type variance.
+Stat names must stay in sync with STAT_MAP in models/props.py — both
+platform spellings of a stat belong here (see CLAUDE.md).
 """
 
-# Stats with naturally high game-to-game variance
+# Rare events: one swing decides the prop
 HIGH_VARIANCE_STATS = {
     "Home Runs", "Stolen Bases", "Singles", "Doubles",
-    "Pitcher Strikeouts (Combo)", "Earned Runs Allowed",
 }
 
 MEDIUM_VARIANCE_STATS = {
-    "Pitcher Strikeouts", "Hits Allowed", "Total Bases",
-    "RBIs", "Runs", "Batter Strikeouts", "Batter Walks",
-    "Pitching Outs", "Pitches Thrown",
+    "Pitcher Strikeouts", "Strikeouts",           # PP / Underdog pitcher Ks
+    "Total Bases", "RBIs", "Runs",
+    "Batter Strikeouts", "Hitter Strikeouts",
+    "Batter Walks", "Walks",
 }
 
 LOW_VARIANCE_STATS = {
     "Hits", "Hits+Runs+RBIs", "Hits + Runs + RBIs",
-    "Hitter Fantasy Score", "Pitcher Fantasy Score",
-    "Fantasy Points",
 }
 
 
 def get_risk_profile(stat_type: str, edge: float) -> str:
     """
-    LOW  — low-variance stat or very high edge (model is highly certain)
-    MEDIUM — moderate variance stat
-    HIGH — high-variance stat or thin edge (close call)
+    LOW  — low-variance stat with a solid edge
+    MEDIUM — moderate variance stat (default for unknown stats)
+    HIGH — high-variance stat
     """
     if stat_type in HIGH_VARIANCE_STATS:
         return "HIGH"
     elif stat_type in LOW_VARIANCE_STATS:
-        if edge >= 0.12:
+        if edge >= 0.08:
             return "LOW"
         return "MEDIUM"
     else:

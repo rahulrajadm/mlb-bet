@@ -1,23 +1,26 @@
 """
-MLB Bet — Streamlit Dashboard
-Tabs: Today's Picks | Game Predictions | Player Props | Platform Comparison | Bankroll Tracker
+MLB Bet — local Streamlit dashboard, backed by SQLite (data/mlb_bet.db).
+Tabs: High Interest | Today's Picks | Game Predictions | Player Props | Bankroll Tracker
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import streamlit as st
 import pandas as pd
+from datetime import datetime, timezone
+
 from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest
 from pipeline.schedule import get_today_games
 from pipeline.prizepicks import get_prizepicks_lines
 from pipeline.underdog import get_underdog_lines
-from pipeline.odds_api import get_all_odds
 from pipeline.recent_form import get_recent_form
 from pipeline.pitcher_stats import get_pitcher_stats
 from pipeline.lineups import lineups_are_posted
-from pipeline.handedness import fetch_and_save_pitcher_hands, fetch_and_save_batter_hands
-from analysis.confidence import TIER_COLORS
-from analysis.risk import RISK_COLORS
+from pipeline.handedness import fetch_and_save_pitcher_hands, fetch_lineup_handedness
+from pipeline.team_names import to_abbr, to_full_name
+from analysis.confidence import TIER_RANK
+from utils.db import get_conn
+from utils.dates import APP_TZ
 
 st.set_page_config(
     page_title="MLB Bet",
@@ -25,6 +28,44 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+EDGE_HELP = (
+    "**Model %** = 55% recent 14-day form + 45% season avg, adjusted for pitcher, park & platoon.  "
+    "**Edge** = Model % − 57.7% break-even (2-pick 3x slip).  "
+    "**EV / 100** = edge per 100 wagered per leg.  "
+    "**Stake** = quarter-Kelly sized as a leg of a 2-pick slip."
+)
+
+
+def lines_last_fetched() -> str | None:
+    """Most recent prop-line fetch, in Central time."""
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT MAX(fetched_at) FROM prop_lines").fetchone()
+        conn.close()
+        if row and row[0]:
+            dt = datetime.fromisoformat(row[0])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(APP_TZ).strftime("%b %d %Y, %I:%M %p")
+    except Exception:
+        pass
+    return None
+
+
+def timestamp_bar():
+    fetched = lines_last_fetched()
+    if fetched:
+        st.markdown(
+            f"<div style='background:#1a1d27;border-left:3px solid #22c55e;padding:8px 14px;"
+            f"border-radius:4px;font-size:0.85rem;color:#9ca3af;margin-bottom:8px'>"
+            f"🕐 Lines last fetched: <strong style='color:#e8eaf0'>{fetched} CT</strong>"
+            f" &nbsp;·&nbsp; Refresh in the sidebar to update</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning("No prop lines in the database — hit Refresh All Data in the sidebar.")
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 
@@ -37,7 +78,7 @@ with st.sidebar:
     unit_size  = st.number_input("1 Unit = ($)",     min_value=1.0,   value=10.0,  step=1.0)
 
     st.divider()
-    if st.button("🔄 Refresh All Data", use_container_width=True):
+    if st.button("🔄 Refresh All Data", width="stretch"):
         with st.spinner("Refreshing lines, form, matchups & handedness…"):
             get_today_games()
             get_prizepicks_lines()
@@ -46,16 +87,16 @@ with st.sidebar:
             get_pitcher_stats()
             fetch_and_save_pitcher_hands()
             try:
-                get_all_odds()
+                fetch_lineup_handedness()
             except Exception:
                 pass
+        st.cache_data.clear()
         st.success("Data refreshed!")
         st.rerun()
 
     # Lineup status indicator
     try:
-        posted = lineups_are_posted()
-        if posted:
+        if lineups_are_posted():
             st.success("✅ Lineups confirmed")
         else:
             st.warning("⏳ Lineups not posted yet")
@@ -71,7 +112,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Data sources: PrizePicks · Underdog · MLB Stats API · The Odds API")
+    st.caption("Data sources: PrizePicks · Underdog · MLB Stats API")
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 
@@ -82,8 +123,6 @@ def load_picks(bankroll, unit_size):
 @st.cache_data(ttl=300)
 def load_games():
     return get_today_games()
-
-TIER_RANK = {"STRONG": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
 with st.spinner("Loading picks…"):
     all_picks = load_picks(bankroll, unit_size)
@@ -98,19 +137,10 @@ else:
 min_rank = TIER_RANK[min_conf]
 filtered = [p for p in filtered if TIER_RANK.get(p["confidence_tier"], 0) >= min_rank]
 
+hi_pool = [p for p in filtered if is_high_interest(p)]
 best = best_picks_per_player(filtered)
-high_interest = best_picks_per_player([p for p in filtered if is_high_interest(p)])
-comparison = platform_comparison(filtered)
-
-# ── Helper: badge HTML ─────────────────────────────────────────────────────────
-
-def conf_badge(tier):
-    color = TIER_COLORS.get(tier, "#94a3b8")
-    return f'<span style="background:{color};color:#000;padding:2px 8px;border-radius:10px;font-size:0.75rem;font-weight:700">{tier}</span>'
-
-def risk_badge(risk):
-    color = RISK_COLORS.get(risk, "#94a3b8")
-    return f'<span style="background:{color};color:#000;padding:2px 8px;border-radius:10px;font-size:0.75rem;font-weight:700">{risk}</span>'
+high_interest = best_picks_per_player(hi_pool)
+comparison = platform_comparison(hi_pool)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 
@@ -122,21 +152,20 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "💰 Bankroll Tracker",
 ])
 
-# ── Tab 1: High Interest ───────────────────────────────────────────────────────
 
-def picks_table(pick_list, max_rows=50, show_context=False):
+def picks_table(pick_list, max_rows=75, show_context=False):
     """Render a styled picks dataframe."""
     rows = []
     for p in pick_list[:max_rows]:
         row = {
             "Player":        p["player_name"],
-            "Team":          p["player_team"],
+            "Team":          to_abbr(p["player_team"]),
             "Stat":          p["stat_type"],
-            "Line":          p["line"],
+            "Line":          f"{p['line']:g}",
             "Pick":          p["direction"],
             "Model %":       f"{p['model_prob']:.1%}",
             "Edge":          f"{p['edge']:+.1%}",
-            "EV / $100":     f"${p['ev_per_100']:+.1f}",
+            "EV / 100":      f"{p['ev_per_100']:+.1f}",
             "Confidence":    p["confidence_tier"],
             "Risk":          p["risk_profile"],
             "Platform":      p["platform"],
@@ -159,84 +188,69 @@ def picks_table(pick_list, max_rows=50, show_context=False):
     df = pd.DataFrame(rows)
 
     def color_conf(val):
-        colors = {"STRONG": "background-color:#22c55e;color:#000",
-                  "HIGH":   "background-color:#86efac;color:#000",
-                  "MEDIUM": "background-color:#fbbf24;color:#000",
-                  "LOW":    "background-color:#94a3b8;color:#000"}
+        colors = {"STRONG": "background-color:#16a34a;color:#fff;font-weight:700",
+                  "HIGH":   "background-color:#22c55e;color:#000;font-weight:700",
+                  "MEDIUM": "background-color:#ca8a04;color:#fff;font-weight:700",
+                  "LOW":    "background-color:#374151;color:#9ca3af;font-weight:700"}
         return colors.get(val, "")
 
     def color_risk(val):
-        colors = {"LOW":    "background-color:#22c55e;color:#000",
-                  "MEDIUM": "background-color:#f97316;color:#000",
-                  "HIGH":   "background-color:#ef4444;color:#fff"}
+        colors = {"LOW":    "background-color:#16a34a;color:#fff;font-weight:700",
+                  "MEDIUM": "background-color:#c2410c;color:#fff;font-weight:700",
+                  "HIGH":   "background-color:#dc2626;color:#fff;font-weight:700"}
         return colors.get(val, "")
 
-    style_fn = df.style.map if hasattr(df.style, "map") else df.style.applymap
-    styled = style_fn(color_conf, subset=["Confidence"])
-    style_fn2 = styled.map if hasattr(styled, "map") else styled.applymap
-    styled = style_fn2(color_risk, subset=["Risk"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    styled = df.style.map(color_conf, subset=["Confidence"]).map(color_risk, subset=["Risk"])
+    st.dataframe(styled, width="stretch", hide_index=True)
 
+
+# ── Tab 1: High Interest ───────────────────────────────────────────────────────
 
 with tab1:
+    timestamp_bar()
     st.header("🔥 High Interest Picks")
     st.caption(
-        "Picks on genuinely contested lines — lines ≥ 1.0, or More on a 0.5 line where the stat is competitive. "
+        "Picks on genuinely contested lines — lines ≥ 1.0, or More on a 0.5 line. "
         "Excludes obvious Less picks on 0.5 HR/SB/Doubles that platforms rarely offer."
     )
 
     col1, col2, col3, col4 = st.columns(4)
-    hi_strong = sum(1 for p in high_interest if p["confidence_tier"] == "STRONG")
-    hi_high   = sum(1 for p in high_interest if p["confidence_tier"] == "HIGH")
-    hi_medium = sum(1 for p in high_interest if p["confidence_tier"] == "MEDIUM")
     col1.metric("High Interest Picks", len(high_interest))
-    col2.metric("STRONG", hi_strong)
-    col3.metric("HIGH", hi_high)
-    col4.metric("MEDIUM", hi_medium)
+    col2.metric("STRONG", sum(1 for p in high_interest if p["confidence_tier"] == "STRONG"))
+    col3.metric("HIGH",   sum(1 for p in high_interest if p["confidence_tier"] == "HIGH"))
+    col4.metric("MEDIUM", sum(1 for p in high_interest if p["confidence_tier"] == "MEDIUM"))
 
     st.divider()
 
-    # Stat type filter
-    stat_types = sorted(set(p["stat_type"] for p in high_interest))
+    stat_types = sorted(set(p["stat_display"] for p in high_interest))
     selected_stats = st.multiselect("Filter by stat type:", stat_types, default=[], key="hi_stats")
-    hi_filtered = [p for p in high_interest if not selected_stats or p["stat_type"] in selected_stats]
+    hi_filtered = [p for p in high_interest if not selected_stats or p["stat_display"] in selected_stats]
 
     show_ctx = st.toggle("Show season rate / recent form / matchup context", value=False)
     picks_table(hi_filtered, max_rows=75, show_context=show_ctx)
-    st.caption(
-        "**Model %** = blended prediction (55% recent 14-day form + 45% season avg), adjusted for opposing pitcher.  "
-        "**Edge** = Model % − 50% implied.  "
-        "**EV/$100** = expected value per $100 per leg.  "
-        "**Stake** = quarter-Kelly for your bankroll."
-    )
+    st.caption(EDGE_HELP)
 
 # ── Tab 2: Today's Picks (all) ─────────────────────────────────────────────────
 
 with tab2:
+    timestamp_bar()
     st.header("Today's Top Picks")
     st.caption("All +EV picks including 0.5 lines. Use the 🔥 High Interest tab for competitive lines only.")
 
     col1, col2, col3, col4 = st.columns(4)
-    strong = sum(1 for p in best if p["confidence_tier"] == "STRONG")
-    high   = sum(1 for p in best if p["confidence_tier"] == "HIGH")
-    medium = sum(1 for p in best if p["confidence_tier"] == "MEDIUM")
     col1.metric("Total Picks", len(best))
-    col2.metric("STRONG", strong)
-    col3.metric("HIGH", high)
-    col4.metric("MEDIUM", medium)
+    col2.metric("STRONG", sum(1 for p in best if p["confidence_tier"] == "STRONG"))
+    col3.metric("HIGH",   sum(1 for p in best if p["confidence_tier"] == "HIGH"))
+    col4.metric("MEDIUM", sum(1 for p in best if p["confidence_tier"] == "MEDIUM"))
 
     st.divider()
     picks_table(best, max_rows=75)
-    st.caption(
-        "**Model %** = model's estimated probability.  "
-        "**Edge** = Model % − 50% implied.  "
-        "**EV/$100** = expected value per $100 per leg.  "
-        "**Stake** = quarter-Kelly for your bankroll."
-    )
+    st.caption(EDGE_HELP)
 
 # ── Tab 3: Game Predictions ────────────────────────────────────────────────────
 
 with tab3:
+    timestamp_bar()
     st.header("Today's Games")
 
     if not games:
@@ -252,13 +266,15 @@ with tab3:
                 col2.markdown(f"**Home:** {g['home_team']}  \n**Starter:** {g['home_starter']}")
                 col3.markdown(f"**Venue:** {g.get('venue', 'N/A')}")
 
-                game_picks = [p for p in high_interest if p.get("player_team") in [g["home_team"], g["away_team"]]]
+                game_teams = {g["home_team"], g["away_team"]}
+                game_picks = [p for p in high_interest
+                              if to_full_name(p.get("player_team", "")) in game_teams]
                 if game_picks:
                     st.markdown(f"**{len(game_picks)} high-interest picks for this game:**")
                     rows = [{
                         "Player":     p["player_name"],
                         "Stat":       p["stat_type"],
-                        "Line":       p["line"],
+                        "Line":       f"{p['line']:g}",
                         "Pick":       p["direction"],
                         "Model %":    f"{p['model_prob']:.1%}",
                         "Edge":       f"{p['edge']:+.1%}",
@@ -266,22 +282,25 @@ with tab3:
                         "Risk":       p["risk_profile"],
                         "Platform":   p["platform"],
                     } for p in game_picks[:15]]
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
                 else:
                     st.caption("No high-interest picks for this game.")
 
 # ── Tab 4: Player Props ────────────────────────────────────────────────────────
 
 with tab4:
+    timestamp_bar()
     st.header("Player Props — Platform Comparison")
     st.caption("Same player-prop shown across PrizePicks and Underdog side-by-side.")
 
     search = st.text_input("Search player name…", "")
 
-    hi_comparison = platform_comparison(high_interest)
-    comp_items = list(hi_comparison.items())
+    comp_items = list(comparison.items())
     if search:
         comp_items = [item for item in comp_items if search.lower() in item[0][0].lower()]
+    # Props offered on both platforms first, then by best edge
+    comp_items.sort(key=lambda item: (len({p["platform"] for p in item[1]}),
+                                      max(p["edge"] for p in item[1])), reverse=True)
 
     if not comp_items:
         st.info("No props match your search.")
@@ -292,19 +311,21 @@ with tab4:
             with st.expander(f"**{player}** — {stat}", expanded=False):
                 rows = [{
                     "Platform":   p["platform"],
-                    "Line":       p["line"],
+                    "Stat name":  p["stat_type"],
+                    "Line":       f"{p['line']:g}",
                     "Pick":       p["direction"],
                     "Model %":    f"{p['model_prob']:.1%}",
                     "Edge":       f"{p['edge']:+.1%}",
-                    "EV/$100":    f"${p['ev_per_100']:+.1f}",
+                    "EV/100":     f"{p['ev_per_100']:+.1f}",
                     "Confidence": p["confidence_tier"],
                     "Risk":       p["risk_profile"],
                 } for p in platform_picks_sorted]
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 # ── Tab 5: Bankroll Tracker ────────────────────────────────────────────────────
 
 with tab5:
+    timestamp_bar()
     st.header("Bankroll Tracker")
 
     col1, col2 = st.columns(2)
@@ -312,26 +333,28 @@ with tab5:
         st.metric("Current Bankroll", f"${bankroll:,.2f}")
         st.divider()
         st.subheader("Recommended Stakes")
-        st.caption("Quarter-Kelly sizing on high-interest picks.")
+        st.caption("Quarter-Kelly sizing on high-interest picks, as legs of a 2-pick slip.")
 
         st.caption(f"1 unit = ${unit_size:.0f}")
         stake_rows = []
         for p in high_interest[:20]:
             stake_rows.append({
                 "Player":        p["player_name"],
-                "Pick":          f"{p['stat_type']} {p['direction']} {p['line']}",
+                "Pick":          f"{p['stat_display']} {p['direction']} {p['line']:g}",
                 "Confidence":    p["confidence_tier"],
                 "Units":         f"{p.get('units', 0):.1f}u",
                 "Stake ($)":     f"${p['stake_dollars']:.2f}",
                 "Potential Win": f"${p['potential_win']:.2f}",
-                "R/R Ratio":     f"{p['risk_reward_ratio']:.1f}x",
             })
         if stake_rows:
-            st.dataframe(pd.DataFrame(stake_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(stake_rows), width="stretch", hide_index=True)
 
     with col2:
         st.subheader("PrizePicks Slip Builder")
-        st.caption("Pick 2–6 legs from High Interest picks to see slip EV.")
+        st.caption(
+            "Pick 2–6 legs from High Interest picks to see slip EV. "
+            "Assumes independent legs — avoid stacking picks from the same game."
+        )
 
         from analysis.ev import ev_slip
         slip_picks = [p["selection"] for p in high_interest[:30]]
@@ -352,7 +375,7 @@ with tab5:
                 st.metric("Model P(all hit)", f"{result['p_all_hit']:.1%}")
                 ev_val = result["ev_per_100"]
                 st.metric(
-                    "EV per $100 entry",
+                    "EV per 100 entry",
                     f"${ev_val:+.2f}",
                     delta="Positive edge" if ev_val > 0 else "Negative edge",
                     delta_color="normal" if ev_val > 0 else "inverse",

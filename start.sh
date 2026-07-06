@@ -26,6 +26,9 @@ python pipeline/pitcher_stats.py
 echo "🤜 Fetching handedness..."
 python pipeline/handedness.py
 
+echo "🎯 Fetching pitcher arsenal (whiff rates)..."
+python pipeline/pitcher_arsenal.py
+
 echo ""
 echo "✅ Data ready. Opening dashboard..."
 echo ""

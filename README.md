@@ -1,8 +1,8 @@
 # MLB Bet: AI-Powered MLB Betting Decision Tool
 
-An ML-driven tool that predicts MLB player and game outcomes, compares model probabilities against live pick'em platform lines, and surfaces positive expected value (+EV) picks with confidence scores, risk profiles, and Kelly-sized stakes.
+A tool that projects MLB player stat outcomes, compares model probabilities against live pick'em platform lines, and surfaces positive expected value (+EV) picks with confidence scores, risk profiles, and Kelly-sized stakes.
 
-Built for Texas-legal pick'em and prediction market platforms: **PrizePicks, Underdog Fantasy, DraftKings Pick6, Chalkboard, Sleeper, Betr, Fliff, Polymarket**.
+Built for Texas-legal pick'em platforms: **PrizePicks** and **Underdog Fantasy**.
 
 ---
 
@@ -14,25 +14,17 @@ Built for Texas-legal pick'em and prediction market platforms: **PrizePicks, Und
 
 ## What it does
 
-1. **Fetches live prop lines** from PrizePicks and Underdog Fantasy
+1. **Fetches live prop lines** from PrizePicks and Underdog Fantasy (standard lines only — goblins/demons change the payout and are excluded)
 2. **Predicts player stat outcomes** using a 5-layer model:
    - Season per-game averages (3-year recency-weighted)
    - Recent form blend (last 14 days at 55%, season at 45%)
-   - Opposing pitcher matchup (K/9 vs league average)
+   - Opposing pitcher matchup (K-rate + arsenal whiff rate vs league average)
    - Park factor adjustment (venue run environment)
    - Platoon split adjustment (batter hand vs pitcher hand)
-3. **Computes edge** — model probability vs 50% implied (pick'em baseline)
+3. **Computes edge** — model probability vs the real pick'em break-even (~57.7% per leg for a 2-pick 3x slip), not a 50% coin flip
 4. **Ranks picks** by confidence tier (STRONG / HIGH / MEDIUM / LOW) and risk profile
-5. **Sizes stakes** using fractional Kelly criterion (0.25×)
+5. **Sizes stakes** using fractional Kelly (0.25×) on the 2-pick slip probability
 6. **Compares lines** across platforms side-by-side to find the best line for each pick
-
----
-
-## Results
-
-- Generates 900+ high-interest picks per day across PrizePicks and Underdog
-- 5-layer prediction model covering season form, recent form, pitcher matchup, park factors, and platoon splits
-- Slip builder calculates EV for PrizePicks Power Play entries (2–6 legs)
 
 ---
 
@@ -43,8 +35,7 @@ Built for Texas-legal pick'em and prediction market platforms: **PrizePicks, Und
 | Player stats | `pybaseball` (Statcast, Baseball Reference) |
 | Live prop lines | PrizePicks API · Underdog API |
 | Schedule & lineups | MLB Stats API (official, free) |
-| Odds reference | The Odds API |
-| Prediction engine | Poisson distribution · XGBoost profiles |
+| Prediction engine | Recency-weighted rate profiles → Poisson distribution |
 | Dashboard | Streamlit |
 | Storage (local) | SQLite |
 
@@ -54,7 +45,7 @@ Built for Texas-legal pick'em and prediction market platforms: **PrizePicks, Und
 
 | Tab | What it shows |
 |---|---|
-| 🔥 High Interest | Picks on competitive lines (≥1.0 or More on contested 0.5 stats) |
+| 🔥 High Interest | Picks on competitive lines (≥1.0, or More on contested 0.5 stats) |
 | 🎯 Today's Picks | All +EV picks |
 | ⚾ Game Predictions | Per-game breakdown with picks for each matchup |
 | 📊 Player Props | Same prop across PrizePicks vs Underdog side-by-side |
@@ -72,26 +63,15 @@ cd mlb-bet
 pip install -r requirements.txt
 ```
 
-### 2. Set environment variables
-
-```bash
-cp .env.example .env
-```
-
-Add your free [The Odds API](https://the-odds-api.com) key to `.env`:
-
-```
-ODDS_API_KEY=your_key_here
-```
-
-### 3. Seed historical data (one-time, ~10 min)
+### 2. Seed historical data (one-time, ~10 min)
 
 ```bash
 python pipeline/historical.py
+python models/train.py
 python pipeline/handedness.py
 ```
 
-### 4. Run daily
+### 3. Run daily
 
 ```bash
 ./start.sh
@@ -110,31 +90,35 @@ alias mlb-bet="/path/to/mlb-bet/start.sh"
 Each player prop prediction is built in 5 layers:
 
 ```
-Base rate (season avg)
+Base rate (season avg, recency-weighted over 2024–26)
   → Blend with recent 14-day form (55% recent / 45% season)
-    → Adjust for opposing pitcher K-rate vs league avg (8.8 K/9)
-      → Adjust for ballpark run environment (e.g. Coors +13.5%, Petco -4.5%)
-        → Adjust for platoon matchup (RHB vs LHP: +4%, same-hand: -1.8%)
+    → Adjust for opposing pitcher K-rate & arsenal whiff rate
+      → Adjust for ballpark run environment (e.g. Coors +13.5%)
+        → Adjust for platoon matchup (batter hand vs pitcher hand)
           → Poisson distribution → P(stat > line)
-            → Edge = P(More or Less) − 50% implied
+            → Edge = P(pick side) − 57.7% break-even (2-pick 3x)
 ```
 
-**Confidence tiers** are tied to edge size:
+Pitcher props are strikeouts only — other pitcher stats (earned runs,
+pitch count, outs) have no per-game rate model and are skipped rather
+than mispriced.
+
+**Confidence tiers** are tied to edge size (vs break-even):
 
 | Tier | Edge |
 |---|---|
-| STRONG | > 15% |
-| HIGH | 10–15% |
-| MEDIUM | 5–10% |
-| LOW | < 5% |
+| STRONG | > 12% |
+| HIGH | 8–12% |
+| MEDIUM | 4–8% |
+| LOW | < 4% |
 
 **Risk profiles** are based on stat-type variance:
 
 | Profile | Stats |
 |---|---|
-| LOW | Fantasy score, Hits+Runs+RBIs |
-| MEDIUM | Hits, RBIs, Strikeouts, Total Bases |
-| HIGH | Home Runs, Stolen Bases, Doubles |
+| LOW | Hits, Hits+Runs+RBIs |
+| MEDIUM | Walks, Strikeouts, RBIs, Runs, Total Bases |
+| HIGH | Home Runs, Stolen Bases, Singles, Doubles |
 
 ---
 
@@ -149,8 +133,8 @@ mlb-bet/
 ├── ui/
 │   ├── app.py        # Local Streamlit dashboard (uses SQLite)
 │   └── app_cloud.py  # Cloud Streamlit dashboard (in-memory, no SQLite)
-├── utils/            # SQLite helpers
-├── data/models/      # Pre-trained player profiles (committed)
+├── utils/            # SQLite, date, and name-matching helpers
+├── data/models/      # Pre-built player rate profiles (committed)
 └── start.sh          # Daily launcher script
 ```
 

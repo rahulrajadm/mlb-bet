@@ -6,8 +6,8 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import requests
-from datetime import date
 from utils.db import get_conn
+from utils.dates import today_str
 
 MLB_API   = "https://statsapi.mlb.com/api/v1"
 CHUNK     = 50   # max IDs per people API call
@@ -57,7 +57,7 @@ def fetch_and_save_pitcher_hands(game_date: str = None) -> dict[str, str]:
     Returns dict: pitcher_name → pitch_hand (L/R/S)
     """
     if game_date is None:
-        game_date = date.today().isoformat()
+        game_date = today_str()
 
     url = f"{MLB_API}/schedule"
     params = {"sportId": 1, "date": game_date, "hydrate": "probablePitcher,team"}
@@ -168,13 +168,56 @@ def load_handedness_from_db() -> dict[str, dict]:
         return {}
 
 
+def fetch_lineup_handedness(game_date: str = None) -> dict[str, dict]:
+    """
+    Handedness for today's confirmed lineups + probable pitchers, fetched
+    straight from the MLB API (no seeded DB required — this is what the
+    cloud app relies on, where batter_game_logs doesn't exist).
+    Returns {name: {pitch_hand, bat_side}} and caches to the local DB.
+    """
+    from pipeline.lineups import get_todays_player_ids
+    ids = get_todays_player_ids(game_date)
+    if not ids:
+        return {}
+    people = _fetch_people(list(ids))
+
+    result = {}
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS player_handedness (
+                name TEXT PRIMARY KEY,
+                pitch_hand TEXT,
+                bat_side TEXT
+            )
+        """)
+        for info in people.values():
+            result[info["name"]] = {"pitch_hand": info["pitch_hand"], "bat_side": info["bat_side"]}
+            c.execute(
+                "INSERT OR REPLACE INTO player_handedness (name, pitch_hand, bat_side) VALUES (?,?,?)",
+                (info["name"], info["pitch_hand"], info["bat_side"])
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        for info in people.values():
+            result[info["name"]] = {"pitch_hand": info["pitch_hand"], "bat_side": info["bat_side"]}
+    return result
+
+
 def get_platoon_adj(bat_side: str, pitch_hand: str, stat_col: str) -> float:
-    """Return platoon adjustment multiplier. 1.0 if stat not affected."""
+    """Return platoon adjustment multiplier. 1.0 if stat not affected.
+    Strikeouts invert: the batter having the platoon advantage means FEWER
+    strikeouts, so so_pg gets the reciprocal of the hit-rate factor."""
     if stat_col not in PLATOON_STATS:
         return 1.0
     if not bat_side or not pitch_hand:
         return 1.0
-    return PLATOON_ADJ.get((bat_side, pitch_hand), 1.0)
+    adj = PLATOON_ADJ.get((bat_side, pitch_hand), 1.0)
+    if stat_col == "so_pg" and adj != 0:
+        return round(1.0 / adj, 4)
+    return adj
 
 
 if __name__ == "__main__":

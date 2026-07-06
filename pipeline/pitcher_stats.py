@@ -7,8 +7,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pandas as pd
 import pybaseball as pb
-from datetime import date, timedelta
+from datetime import timedelta
 from utils.db import get_conn
+from utils.dates import today_local
+from utils.names import clean_name, make_lookup
 
 LEAGUE_AVG_K9   = 8.8
 LEAGUE_AVG_K_GS = 5.5
@@ -19,9 +21,10 @@ SEASON_WEIGHT   = 0.40
 
 
 def pull_pitcher_stats() -> pd.DataFrame:
-    season = date.today().year
+    season = today_local().year
     print(f"  Pulling season pitcher stats ({season})...")
     df = pb.pitching_stats_bref(season)
+    df["Name"] = df["Name"].map(clean_name)
 
     starters = df[pd.to_numeric(df["GS"], errors="coerce") >= 3].copy()
     starters["IP_num"]   = pd.to_numeric(starters["IP"],  errors="coerce")
@@ -38,11 +41,12 @@ def pull_pitcher_stats() -> pd.DataFrame:
 
 
 def pull_recent_pitcher_form() -> pd.DataFrame:
-    end   = date.today()
+    end   = today_local()
     start = end - timedelta(days=RECENT_DAYS)
     print(f"  Pulling recent pitcher form {start} → {end} (~last 3 starts)...")
     try:
         df = pb.pitching_stats_range(str(start), str(end))
+        df["Name"] = df["Name"].map(clean_name)
         starters = df[pd.to_numeric(df["GS"], errors="coerce") >= 1].copy()
         starters["SO_num"]        = pd.to_numeric(starters["SO"], errors="coerce")
         starters["GS_num"]        = pd.to_numeric(starters["GS"], errors="coerce")
@@ -106,33 +110,43 @@ def get_pitcher_stats() -> pd.DataFrame:
     return blended
 
 
-def lookup_pitcher(name: str, df: pd.DataFrame) -> dict:
-    """Return a pitcher's blended matchup stats, falling back to league average."""
-    default = {
-        "k_per_9": LEAGUE_AVG_K9, "k_per_gs": LEAGUE_AVG_K_GS,
-        "blended_k_gs": LEAGUE_AVG_K_GS, "era": LEAGUE_AVG_ERA, "k_adj": 1.0,
-        "recent_k_gs": None, "recent_era": None,
+LEAGUE_DEFAULT = {
+    "k_per_9": LEAGUE_AVG_K9, "k_per_gs": LEAGUE_AVG_K_GS,
+    "blended_k_gs": LEAGUE_AVG_K_GS, "era": LEAGUE_AVG_ERA, "k_adj": 1.0,
+    "recent_k_gs": None, "recent_era": None, "gs": 0,
+}
+
+
+def _row_to_info(row) -> dict:
+    return {
+        "k_per_9":      float(row["k_per_9"])      if pd.notna(row.get("k_per_9"))      else LEAGUE_AVG_K9,
+        "k_per_gs":     float(row["k_per_gs"])     if pd.notna(row.get("k_per_gs"))     else LEAGUE_AVG_K_GS,
+        "blended_k_gs": float(row["blended_k_gs"]) if pd.notna(row.get("blended_k_gs")) else LEAGUE_AVG_K_GS,
+        "era":          float(row["ERA"])           if pd.notna(row.get("ERA"))          else LEAGUE_AVG_ERA,
+        "k_adj":        float(row["k_adj"])         if pd.notna(row.get("k_adj"))        else 1.0,
+        "recent_k_gs":  float(row["recent_k_gs"])  if pd.notna(row.get("recent_k_gs"))  else None,
+        "recent_era":   float(row["recent_era"])   if pd.notna(row.get("recent_era"))   else None,
+        "gs":           int(row["GS"])              if pd.notna(row.get("GS"))           else 0,
     }
-    if df.empty:
-        return default
 
-    match = df[df["Name"].str.lower() == name.lower()]
-    if match.empty:
-        last = name.split()[-1].lower()
-        match = df[df["Name"].str.lower().str.contains(last, na=False)]
 
-    if not match.empty:
-        row = match.iloc[0]
-        return {
-            "k_per_9":      float(row["k_per_9"])      if pd.notna(row.get("k_per_9"))      else LEAGUE_AVG_K9,
-            "k_per_gs":     float(row["k_per_gs"])     if pd.notna(row.get("k_per_gs"))     else LEAGUE_AVG_K_GS,
-            "blended_k_gs": float(row["blended_k_gs"]) if pd.notna(row.get("blended_k_gs")) else LEAGUE_AVG_K_GS,
-            "era":          float(row["ERA"])           if pd.notna(row.get("ERA"))          else LEAGUE_AVG_ERA,
-            "k_adj":        float(row["k_adj"])         if pd.notna(row.get("k_adj"))        else 1.0,
-            "recent_k_gs":  float(row["recent_k_gs"])  if pd.notna(row.get("recent_k_gs"))  else None,
-            "recent_era":   float(row["recent_era"])   if pd.notna(row.get("recent_era"))   else None,
-        }
-    return default
+def make_pitcher_lookup(df: pd.DataFrame):
+    """name → stats dict | None. Build once per prediction run — matching is
+    accent/suffix-normalized and refuses ambiguous last names."""
+    row_lookup = make_lookup(df)
+
+    def lookup(name: str) -> dict | None:
+        row = row_lookup(name)
+        return _row_to_info(row) if row is not None else None
+
+    return lookup
+
+
+def lookup_pitcher(name: str, df: pd.DataFrame) -> dict:
+    """Single lookup with league-average fallback (opponent-adjustment path —
+    a missing opponent means 'no adjustment', not 'no prediction')."""
+    info = make_pitcher_lookup(df)(name)
+    return info if info is not None else dict(LEAGUE_DEFAULT)
 
 
 if __name__ == "__main__":

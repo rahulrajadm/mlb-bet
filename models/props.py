@@ -5,10 +5,21 @@ Five-layer prediction:
 1. Season average per-game rate (from batter/pitcher profiles)
 2. Recent form blend (last 14 days weighted 55%, season 45%)
 3. Opposing starter matchup adjustment (pitcher K-rate vs league avg)
-4. Park factor adjustment (venue run/HR environment)
+4. Park factor adjustment (venue run environment)
 5. Platoon adjustment (batter hand vs pitcher hand)
 
-Lineup filter: if confirmed lineups are posted, only predict for confirmed starters.
+Then Poisson P(> line), with the winning side's edge measured against the
+platform break-even (~0.577 for a 2-pick 3x) — not 0.50.
+
+Only "standard" odds_type lines are priced: goblins/demons change the payout
+and are More-only, so our EV math doesn't apply to them.
+
+Pitcher props are strikeouts only. Other pitcher stats (ER, hits allowed,
+pitch count, outs) have no per-game rate model and are deliberately skipped
+— see UNMODELED_STATS.
+
+Filter diagnostics print to stderr as `[props] lines=... passed=...`;
+check them after any change to stat mapping or filters.
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -18,11 +29,15 @@ import numpy as np
 import joblib
 from scipy.stats import poisson
 from utils.db import get_conn
+from utils.dates import today_str, local_day_utc_bounds
+from utils.names import clean_name, normalize_name, make_lookup
+from pipeline.team_names import to_full_name
 from pipeline.lineups import get_confirmed_players, lineups_are_posted
-from pipeline.pitcher_stats import lookup_pitcher
+from pipeline.pitcher_stats import make_pitcher_lookup, LEAGUE_DEFAULT
 from pipeline.park_factors import apply_park_factor
 from pipeline.handedness import load_handedness_from_db, get_platoon_adj
-from pipeline.pitcher_arsenal import load_arsenal_from_db, lookup_arsenal
+from pipeline.pitcher_arsenal import load_arsenal_from_db, make_arsenal_lookup
+from analysis.ev import breakeven_prob
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../data/models")
 
@@ -39,38 +54,60 @@ PITCHER_ADJ_BATTER_STATS = {
     "h_r_rbi_pg", "singles_pg", "doubles_pg", "so_pg",
 }
 
-# Stats that are pitcher props (opposing lineup quality matters, handled separately)
-PITCHER_PROP_STATS = {
-    "Pitcher Strikeouts", "Earned Runs Allowed", "Hits Allowed",
-    "Pitches Thrown", "Pitching Outs", "Pitcher Fantasy Score",
-    "Pitcher Strikeouts (Combo)",
+# Pitcher props we model: strikeouts only ("Strikeouts" is Underdog's name)
+PITCHER_PROP_STATS = {"Pitcher Strikeouts", "Strikeouts"}
+
+# Maps platform stat names → internal rate column.
+# A new stat must also be added to analysis/risk.py variance sets and, if
+# rare-event, NO_LESS_AT_HALF in picks/engine.py (see CLAUDE.md).
+STAT_MAP = {
+    "Pitcher Strikeouts":  "k_pg",
+    "Strikeouts":          "k_pg",     # Underdog pitcher Ks
+    "Hitter Strikeouts":   "so_pg",
+    "Batter Strikeouts":   "so_pg",
+    "Hits":                "hits_pg",
+    "Home Runs":           "hr_pg",
+    "RBIs":                "rbi_pg",
+    "Runs":                "runs_pg",
+    "Total Bases":         "tb_pg",
+    "Hits+Runs+RBIs":      "h_r_rbi_pg",
+    "Hits + Runs + RBIs":  "h_r_rbi_pg",
+    "Singles":             "singles_pg",
+    "Doubles":             "doubles_pg",
+    "Walks":               "bb_pg",
+    "Batter Walks":        "bb_pg",
+    "Stolen Bases":        "sb_pg",
 }
 
-# Maps platform stat names → internal rate column
-STAT_MAP = {
-    "Pitcher Strikeouts":         "k_pg",
-    "Hitter Strikeouts":          "so_pg",
-    "Batter Strikeouts":          "so_pg",
-    "Hitter Fantasy Score":       "fantasy_score_pg",
-    "Pitcher Fantasy Score":       "fantasy_score_pg",
-    "Fantasy Points":             "fantasy_score_pg",
-    "Hits":                       "hits_pg",
-    "Home Runs":                  "hr_pg",
-    "RBIs":                       "rbi_pg",
-    "Runs":                       "runs_pg",
-    "Total Bases":                "tb_pg",
-    "Hits+Runs+RBIs":             "h_r_rbi_pg",
-    "Hits + Runs + RBIs":         "h_r_rbi_pg",
-    "Singles":                    "singles_pg",
-    "Doubles":                    "doubles_pg",
-    "Walks":                      "bb_pg",
-    "Batter Walks":               "bb_pg",
-    "Stolen Bases":               "sb_pg",
-    "Earned Runs Allowed":        "era_pg",
-    "Hits Allowed":               "hits_allowed_pg",
-    "Pitches Thrown":             "pitches_pg",
-    "Pitching Outs":              "pitching_outs_pg",
-    "Pitcher Strikeouts (Combo)": "k_pg",
+# Canonical display name per internal rate column — cross-platform grouping
+# (PP "Walks" and UD "Batter Walks" are the same prop).
+STAT_DISPLAY = {
+    "k_pg":       "Pitcher Strikeouts",
+    "so_pg":      "Batter Strikeouts",
+    "hits_pg":    "Hits",
+    "hr_pg":      "Home Runs",
+    "rbi_pg":     "RBIs",
+    "runs_pg":    "Runs",
+    "tb_pg":      "Total Bases",
+    "h_r_rbi_pg": "Hits + Runs + RBIs",
+    "singles_pg": "Singles",
+    "doubles_pg": "Doubles",
+    "bb_pg":      "Walks",
+    "sb_pg":      "Stolen Bases",
+}
+
+# Lines we knowingly don't model: continuous/scored stats with no rate column
+# (fantasy), pitcher stats with no per-game model, multi-player combos, and
+# partial-inning exotics. Skipped with a counter, not silently.
+UNMODELED_STATS = {
+    "Hitter Fantasy Score", "Pitcher Fantasy Score", "Fantasy Points",
+    "Earned Runs Allowed", "Hits Allowed", "Walks Allowed",
+    "Pitches Thrown", "Pitching Outs",
+    "Pitcher Strikeouts (Combo)",
+    "1st Inning Walks Allowed", "1st Inning Runs Allowed",
+    "1st Inn. Pitch Count", "1st Inn. Batters Faced",
+    "1st Inn. Hits Allowed", "1st Inn. Runs Allowed", "1st Inn. Strikeouts",
+    "Plate Appearances", "Triples",
 }
 
 
@@ -106,77 +143,290 @@ def load_pitcher_season_stats() -> pd.DataFrame:
 
 def load_games_today() -> pd.DataFrame:
     conn = get_conn()
-    df = pd.read_sql("SELECT * FROM games WHERE date = DATE('now')", conn)
+    df = pd.read_sql("SELECT * FROM games WHERE date = ?", conn, params=(today_str(),))
     conn.close()
     return df
 
 
-def get_recent_rate(player_name: str, stat_col: str, recent_batting: pd.DataFrame, recent_pitching: pd.DataFrame) -> float | None:
-    """Look up player's recent per-game rate from last 14 days."""
-    name_lower = player_name.lower()
+# Maps internal stat col → recent_batting column name. A new batter stat
+# needs an entry here too, or it silently blends season-only.
+RECENT_COL_MAP = {
+    "hits_pg":    "H_pg",
+    "hr_pg":      "HR_pg",
+    "rbi_pg":     "RBI_pg",
+    "runs_pg":    "R_pg",
+    "bb_pg":      "BB_pg",
+    "so_pg":      "SO_pg",
+    "sb_pg":      "SB_pg",
+    "doubles_pg": "2B_pg",
+    "singles_pg": "singles_pg",
+    "tb_pg":      "tb_pg",
+    "h_r_rbi_pg": "h_r_rbi_pg",
+}
 
-    # Map internal stat col → recent_batting column name
-    recent_col_map = {
-        "hits_pg":       "H_pg",
-        "hr_pg":         "HR_pg",
-        "rbi_pg":        "RBI_pg",
-        "runs_pg":       "R_pg",
-        "bb_pg":         "BB_pg",
-        "so_pg":         "SO_pg",
-        "sb_pg":         "SB_pg",
-        "doubles_pg":    "2B_pg",
-        "singles_pg":    "singles_pg",
-        "tb_pg":         "tb_pg",
-        "h_r_rbi_pg":    "h_r_rbi_pg",
-    }
-    recent_col = recent_col_map.get(stat_col)
 
-    for df in [recent_batting, recent_pitching]:
-        if df.empty or "Name" not in df.columns:
-            continue
-        match = df[df["Name"].str.lower() == name_lower]
-        if match.empty:
-            last = name_lower.split()[-1]
-            match = df[df["Name"].str.lower().str.contains(last, na=False)]
-        if not match.empty and recent_col and recent_col in match.columns:
-            val = match.iloc[0][recent_col]
-            if pd.notna(val) and val >= 0:
-                return float(val)
-
+def _rate_from_row(row, col) -> float | None:
+    if row is None or col not in row:
+        return None
+    val = row[col]
+    if pd.notna(val) and val >= 0:
+        return float(val)
     return None
 
 
-def get_season_rate(player_name: str, stat_col: str, batters: pd.DataFrame, pitchers: pd.DataFrame) -> float | None:
-    """Look up player's season per-game rate from historical profiles."""
-    name_lower = player_name.lower()
-    for df in [batters, pitchers]:
-        if "Name" not in df.columns:
+def prob_more_less(expected_rate: float, line: float) -> tuple[float, float]:
+    """
+    Win probabilities for More/Less on a Poisson stat.
+    x.5 lines: P(X ≥ ceil(line)) vs the complement.
+    Whole-number lines push at X == line (refund): win probabilities are
+    conditioned on no push.
+    """
+    if float(line).is_integer():
+        line_i = int(line)
+        p_more = 1.0 - poisson.cdf(line_i, mu=expected_rate)
+        p_less = poisson.cdf(line_i - 1, mu=expected_rate)
+        denom = p_more + p_less
+        if denom <= 0:
+            return 0.5, 0.5
+        return p_more / denom, p_less / denom
+    threshold = int(np.ceil(line))
+    p_more = 1.0 - poisson.cdf(threshold - 1, mu=expected_rate)
+    return p_more, 1.0 - p_more
+
+
+def predict_props(
+    platform: str = None,
+    # Optional pre-fetched data for cloud/in-memory mode (skips SQLite reads)
+    lines_data: list[dict] | None = None,
+    games_data: list[dict] | None = None,
+    recent_batting_data: pd.DataFrame | None = None,
+    recent_pitching_data: pd.DataFrame | None = None,
+    pitcher_stats_data: pd.DataFrame | None = None,
+    handedness_data: dict | None = None,
+    confirmed_players_data: set | None = None,
+    arsenal_data: pd.DataFrame | None = None,
+) -> list[dict]:
+    batters, pitchers = load_profiles()
+
+    # Use pre-fetched data if provided, otherwise read from SQLite
+    if recent_batting_data is not None and recent_pitching_data is not None:
+        recent_batting, recent_pitching = recent_batting_data, recent_pitching_data
+    else:
+        recent_batting, recent_pitching = load_recent_form()
+
+    pitcher_stats = pitcher_stats_data if pitcher_stats_data is not None else load_pitcher_season_stats()
+    handedness_db = handedness_data if handedness_data is not None else load_handedness_from_db()
+    arsenal_db    = arsenal_data if arsenal_data is not None else load_arsenal_from_db()
+
+    if games_data is not None:
+        games = pd.DataFrame(games_data)
+    else:
+        games = load_games_today()
+
+    # Lineup filter (batters only — pitcher props come from probable starters)
+    if confirmed_players_data is not None:
+        lineups_posted    = len(confirmed_players_data) > 0
+        confirmed_players = confirmed_players_data
+    else:
+        lineups_posted    = lineups_are_posted()
+        confirmed_players = get_confirmed_players() if lineups_posted else set()
+    confirmed_norm = {normalize_name(n) for n in confirmed_players}
+
+    # Per-team game context keyed by MLB full team name
+    team_context: dict[str, dict] = {}
+    if not games.empty:
+        for _, g in games.iterrows():
+            home, away = g.get("home_team", ""), g.get("away_team", "")
+            venue = g.get("venue", "")
+            team_context[home] = {"opp_starter": g.get("away_starter", ""), "venue": venue}
+            team_context[away] = {"opp_starter": g.get("home_starter", ""), "venue": venue}
+
+    # Name-safe lookups, built once
+    batter_lookup     = make_lookup(batters)
+    recent_bat_lookup = make_lookup(recent_batting)
+    pitcher_lookup    = make_pitcher_lookup(pitcher_stats)
+    arsenal_lookup    = make_arsenal_lookup(arsenal_db)
+    handedness_norm   = {normalize_name(k): v for k, v in handedness_db.items()}
+
+    # Build lines DataFrame from pre-fetched data or SQLite
+    if lines_data is not None:
+        lines = pd.DataFrame(lines_data)
+        if platform:
+            lines = lines[lines["platform"] == platform]
+    else:
+        conn = get_conn()
+        start_utc, end_utc = local_day_utc_bounds()
+        query = "SELECT * FROM prop_lines WHERE fetched_at >= ? AND fetched_at < ?"
+        params = [start_utc, end_utc]
+        if platform:
+            query += " AND platform = ?"
+            params.append(platform)
+        lines = pd.read_sql(query, conn, params=params)
+        conn.close()
+
+    if lines.empty:
+        print("[props] no lines for today", file=sys.stderr)
+        return []
+
+    if "odds_type" not in lines.columns:
+        lines["odds_type"] = "standard"
+    lines["odds_type"] = lines["odds_type"].fillna("standard")
+
+    # Latest line per platform+player+stat+odds_type
+    lines = lines.sort_values("fetched_at", ascending=False).drop_duplicates(
+        subset=["platform", "player_name", "stat_type", "odds_type"]
+    )
+
+    counts = {"lines": len(lines), "non_standard": 0, "unmodeled": 0, "no_stat": 0,
+              "not_confirmed": 0, "no_profile": 0, "no_edge": 0, "passed": 0}
+    unknown_stat_types: set[str] = set()
+
+    predictions = []
+    for _, row in lines.iterrows():
+        stat_type = row["stat_type"]
+        if row.get("odds_type", "standard") != "standard":
+            counts["non_standard"] += 1
             continue
-        match = df[df["Name"].str.lower() == name_lower]
-        if match.empty:
-            last = name_lower.split()[-1]
-            match = df[df["Name"].str.lower().str.contains(last, na=False)]
-        if not match.empty and stat_col in match.columns:
-            val = match.iloc[0][stat_col]
-            if pd.notna(val) and val >= 0:
-                return float(val)
-    return None
+        if stat_type in UNMODELED_STATS:
+            counts["unmodeled"] += 1
+            continue
+        stat_col = STAT_MAP.get(stat_type)
+        if stat_col is None or row["line"] is None:
+            counts["no_stat"] += 1
+            unknown_stat_types.add(stat_type)
+            continue
 
+        player_name = clean_name(row["player_name"])
+        line        = float(row["line"])
+        is_pitcher_prop = stat_type in PITCHER_PROP_STATS
 
-def get_opponent_pitcher(player_team: str, games: pd.DataFrame) -> str:
-    """Given a batter's team, find tonight's opposing starting pitcher name."""
-    for _, g in games.iterrows():
-        if player_team and (
-            player_team.lower() in g.get("home_team", "").lower() or
-            g.get("home_team", "").lower() in player_team.lower()
-        ):
-            return g.get("away_starter", "TBD")
-        if player_team and (
-            player_team.lower() in g.get("away_team", "").lower() or
-            g.get("away_team", "").lower() in player_team.lower()
-        ):
-            return g.get("home_starter", "TBD")
-    return "TBD"
+        # Lineup filter: batters only (probable pitchers are in the confirmed
+        # set, but exempting pitcher props guards against name-format drift)
+        if (not is_pitcher_prop and lineups_posted and confirmed_norm
+                and normalize_name(player_name) not in confirmed_norm):
+            counts["not_confirmed"] += 1
+            continue
+
+        team_full = to_full_name(row.get("player_team", ""))
+        ctx       = team_context.get(team_full, {})
+        venue     = ctx.get("venue", "")
+        opp_pitcher = ctx.get("opp_starter", "") or "TBD"
+
+        matchup_note = "no_adj"
+        arsenal_note = ""
+        platoon_note = ""
+        park_note    = venue if venue else "avg"
+
+        if is_pitcher_prop:
+            info = pitcher_lookup(player_name)
+            if info is None or info["blended_k_gs"] <= 0:
+                # No standalone rate for this pitcher — a league-average prop
+                # prediction is noise, so skip rather than default.
+                counts["no_profile"] += 1
+                continue
+            season_rate  = info["k_per_gs"]
+            recent_rate  = info["recent_k_gs"]
+            blended_rate = info["blended_k_gs"]
+            form_source  = "blended_pitcher" if recent_rate else "season_only"
+            games_sample = info["gs"]
+            matchup_note = f"K/GS: season={season_rate:.1f}" + (f" recent={recent_rate:.1f}" if recent_rate else "")
+
+            # Arsenal adjustment: pitcher's own whiff rate vs league avg
+            arsenal_info = arsenal_lookup(player_name)
+            blended_rate = blended_rate * arsenal_info["arsenal_adj"]
+            if arsenal_info["arsenal_adj"] != 1.0:
+                arsenal_note = f"whiff={arsenal_info['arsenal_whiff_pct']:.1f}% adj={arsenal_info['arsenal_adj']:.2f}x"
+
+        else:
+            profile_row = batter_lookup(player_name)
+            season_rate = _rate_from_row(profile_row, stat_col)
+            if season_rate is None:
+                counts["no_profile"] += 1
+                continue
+            games_sample = int(profile_row.get("games_sample", 0) or 0)
+
+            recent_row  = recent_bat_lookup(player_name)
+            recent_rate = _rate_from_row(recent_row, RECENT_COL_MAP.get(stat_col, ""))
+
+            if recent_rate is not None:
+                blended_rate = RECENT_WEIGHT * recent_rate + SEASON_WEIGHT * season_rate
+                form_source  = "blended"
+            else:
+                blended_rate = season_rate
+                form_source  = "season_only"
+
+            # 3. Opposing-starter matchup + arsenal
+            if stat_col in PITCHER_ADJ_BATTER_STATS and opp_pitcher and opp_pitcher != "TBD":
+                opp_info = pitcher_lookup(opp_pitcher) or dict(LEAGUE_DEFAULT)
+                k_adj = opp_info["k_adj"]
+                blended_rate = apply_pitcher_matchup(blended_rate, stat_col, k_adj)
+                matchup_note = f"vs {opp_pitcher} (k_adj={k_adj:.2f})"
+
+                opp_arsenal = arsenal_lookup(opp_pitcher)
+                if opp_arsenal["arsenal_adj"] != 1.0:
+                    arsenal_mult = 1.0 - 0.3 * (opp_arsenal["arsenal_adj"] - 1.0)
+                    blended_rate = max(blended_rate * arsenal_mult, 0.0)
+                    arsenal_note = f"arsenal_adj={opp_arsenal['arsenal_adj']:.2f}x"
+
+            # 4. Park factor
+            blended_rate = apply_park_factor(blended_rate, stat_col, venue)
+
+            # 5. Platoon (batter hand vs opposing starter's hand)
+            bat_side   = handedness_norm.get(normalize_name(player_name), {}).get("bat_side", "")
+            pitch_hand = handedness_norm.get(normalize_name(opp_pitcher), {}).get("pitch_hand", "")
+            if bat_side and pitch_hand:
+                platoon_mult = get_platoon_adj(bat_side, pitch_hand, stat_col)
+                blended_rate = max(blended_rate * platoon_mult, 0.0)
+                platoon_note = f"{bat_side}HB vs {pitch_hand}HP ({platoon_mult:.3f}x)"
+
+        if blended_rate <= 0:
+            counts["no_profile"] += 1
+            continue
+
+        p_more, p_less = prob_more_less(blended_rate, line)
+        breakeven = breakeven_prob(row["platform"])
+
+        if p_more >= p_less:
+            direction, model_prob = "More", p_more
+        else:
+            direction, model_prob = "Less", p_less
+        edge = model_prob - breakeven
+
+        if edge <= 0:
+            counts["no_edge"] += 1
+            continue
+
+        counts["passed"] += 1
+        predictions.append({
+            "platform":      row["platform"],
+            "player_name":   player_name,
+            "player_team":   row.get("player_team", ""),
+            "stat_type":     stat_type,
+            "stat_key":      stat_col,
+            "stat_display":  STAT_DISPLAY.get(stat_col, stat_type),
+            "line":          line,
+            "direction":     direction,
+            "model_prob":    round(model_prob, 4),
+            "implied_prob":  round(breakeven, 4),
+            "edge":          round(edge, 4),
+            "expected_rate": round(blended_rate, 3),
+            "season_rate":   round(season_rate, 3),
+            "recent_rate":   round(recent_rate, 3) if recent_rate is not None else None,
+            "games_sample":  games_sample,
+            "form_source":   form_source,
+            "matchup":       matchup_note,
+            "arsenal":       arsenal_note,
+            "park":          park_note,
+            "platoon":       platoon_note,
+            "game_id":       row.get("game_id", ""),
+        })
+
+    diag = " ".join(f"{k}={v}" for k, v in counts.items())
+    print(f"[props] {diag}", file=sys.stderr)
+    if unknown_stat_types:
+        print(f"[props] unknown_stat_types={sorted(unknown_stat_types)}", file=sys.stderr)
+
+    return predictions
 
 
 def apply_pitcher_matchup(base_rate: float, stat_col: str, k_adj: float) -> float:
@@ -195,226 +445,17 @@ def apply_pitcher_matchup(base_rate: float, stat_col: str, k_adj: float) -> floa
     return max(base_rate * adj, 0.0)
 
 
-def prob_over_line(expected_rate: float, line: float) -> float:
-    """P(stat > line) using Poisson distribution."""
-    threshold = int(np.ceil(line))
-    return 1.0 - poisson.cdf(threshold - 1, mu=expected_rate)
-
-
-def predict_props(
-    platform: str = None,
-    # Optional pre-fetched data for cloud/in-memory mode (skips SQLite reads)
-    lines_data: list[dict] | None = None,
-    games_data: list[dict] | None = None,
-    recent_batting_data: pd.DataFrame | None = None,
-    recent_pitching_data: pd.DataFrame | None = None,
-    pitcher_stats_data: pd.DataFrame | None = None,
-    handedness_data: dict | None = None,
-    confirmed_players_data: set | None = None,
-) -> list[dict]:
-    batters, pitchers = load_profiles()
-
-    # Use pre-fetched data if provided, otherwise read from SQLite
-    if recent_batting_data is not None and recent_pitching_data is not None:
-        recent_batting, recent_pitching = recent_batting_data, recent_pitching_data
-    else:
-        recent_batting, recent_pitching = load_recent_form()
-
-    pitcher_stats = pitcher_stats_data if pitcher_stats_data is not None else load_pitcher_season_stats()
-    handedness_db = handedness_data if handedness_data is not None else load_handedness_from_db()
-    arsenal_db    = load_arsenal_from_db()
-
-    if games_data is not None:
-        games = pd.DataFrame(games_data)
-    else:
-        games = load_games_today()
-
-    # Lineup filter
-    if confirmed_players_data is not None:
-        lineups_posted    = len(confirmed_players_data) > 0
-        confirmed_players = confirmed_players_data
-    else:
-        lineups_posted    = lineups_are_posted()
-        confirmed_players = get_confirmed_players() if lineups_posted else set()
-
-    # Build venue lookup: team_name → venue
-    venue_map = {}
-    if not games.empty:
-        for _, g in games.iterrows():
-            venue_map[g.get("home_team", "")] = g.get("venue", "")
-            venue_map[g.get("away_team", "")] = g.get("venue", "")
-
-    # Build lines DataFrame from pre-fetched data or SQLite
-    if lines_data is not None:
-        lines = pd.DataFrame(lines_data)
-        if platform:
-            lines = lines[lines["platform"] == platform]
-    else:
-        conn = get_conn()
-        query = "SELECT * FROM prop_lines WHERE DATE(fetched_at) = DATE('now')"
-        if platform:
-            query += f" AND platform = '{platform}'"
-        lines = pd.read_sql(query, conn)
-        conn.close()
-
-    lines = lines.sort_values("fetched_at", ascending=False).drop_duplicates(
-        subset=["platform", "player_name", "stat_type"]
-    )
-
-    predictions = []
-    for _, row in lines.iterrows():
-        stat_col = STAT_MAP.get(row["stat_type"])
-        if stat_col is None or row["line"] is None:
-            continue
-
-        player_name = row["player_name"]
-        line        = float(row["line"])
-
-        # Lineup filter: skip if lineups are posted and player isn't confirmed
-        if lineups_posted and confirmed_players and player_name not in confirmed_players:
-            continue
-
-        is_pitcher_prop = row["stat_type"] in PITCHER_PROP_STATS
-        player_team     = row.get("player_team", "")
-
-        # For pitcher props: derive rate directly from pitcher stats (bypasses batter profile lookup)
-        if is_pitcher_prop:
-            pitcher_info = lookup_pitcher(player_name, pitcher_stats)
-            blended_rate = pitcher_info["blended_k_gs"]
-            season_rate  = pitcher_info["k_per_gs"]
-            recent_k     = pitcher_info.get("recent_k_gs")
-            recent_rate  = recent_k
-            form_source  = "blended_pitcher" if recent_k else "season_only"
-
-            if blended_rate <= 0:
-                continue
-
-            opp_pitcher  = "TBD"
-            k_adj        = 1.0
-            matchup_note = f"K/GS: season={season_rate:.1f}" + (f" recent={recent_k:.1f}" if recent_k else "")
-            arsenal_note = ""
-
-            # Arsenal adjustment: pitcher's own whiff rate vs league avg
-            arsenal_info  = lookup_arsenal(player_name, arsenal_db)
-            arsenal_adj   = arsenal_info["arsenal_adj"]
-            blended_rate  = blended_rate * arsenal_adj
-            arsenal_note  = f"whiff={arsenal_info['arsenal_whiff_pct']:.1f}% adj={arsenal_adj:.2f}x"
-
-        else:
-            # Batter props: use historical profiles
-            season_rate = get_season_rate(player_name, stat_col, batters, pitchers)
-            if season_rate is None:
-                continue
-
-            recent_rate = get_recent_rate(player_name, stat_col, recent_batting, recent_pitching)
-
-            if recent_rate is not None:
-                blended_rate = RECENT_WEIGHT * recent_rate + SEASON_WEIGHT * season_rate
-                form_source  = "blended"
-            else:
-                blended_rate = season_rate
-                form_source  = "season_only"
-
-        # 3. Pitcher matchup + arsenal (batter stats only — pitcher props handled above)
-        opp_pitcher  = opp_pitcher  if is_pitcher_prop else "TBD"
-        k_adj        = k_adj        if is_pitcher_prop else 1.0
-        matchup_note = matchup_note if is_pitcher_prop else "no_adj"
-        arsenal_note = arsenal_note if is_pitcher_prop else ""
-
-        if not is_pitcher_prop and not games.empty and stat_col in PITCHER_ADJ_BATTER_STATS:
-                # For batter stats: adjust based on opposing pitcher
-                opp_pitcher  = get_opponent_pitcher(player_team, games)
-                if opp_pitcher and opp_pitcher != "TBD":
-                    pitcher_info = lookup_pitcher(opp_pitcher, pitcher_stats)
-                    k_adj        = pitcher_info["k_adj"]
-                    blended_rate = apply_pitcher_matchup(blended_rate, stat_col, k_adj)
-
-                    # Arsenal adjustment on batter: high-whiff pitcher → harder to hit
-                    arsenal_info = lookup_arsenal(opp_pitcher, arsenal_db)
-                    if arsenal_info["arsenal_adj"] != 1.0 and stat_col in PITCHER_ADJ_BATTER_STATS:
-                        arsenal_mult = 1.0 - 0.3 * (arsenal_info["arsenal_adj"] - 1.0)
-                        blended_rate = max(blended_rate * arsenal_mult, 0.0)
-                        arsenal_note = f"arsenal_adj={arsenal_info['arsenal_adj']:.2f}x"
-
-                    matchup_note = f"vs {opp_pitcher} (k_adj={k_adj:.2f})"
-
-        # 4. Park factor adjustment
-        venue        = venue_map.get(player_team, "")
-        park_note    = venue if venue else "avg"
-        blended_rate = apply_park_factor(blended_rate, stat_col, venue)
-
-        # 5. Platoon adjustment (batter hand vs pitcher hand, batter props only)
-        platoon_note = ""
-        if not is_pitcher_prop:
-            player_info    = handedness_db.get(player_name, {})
-            bat_side       = player_info.get("bat_side", "")
-            pitcher_info_h = handedness_db.get(opp_pitcher, {})
-            pitch_hand     = pitcher_info_h.get("pitch_hand", "")
-            if bat_side and pitch_hand:
-                platoon_mult = get_platoon_adj(bat_side, pitch_hand, stat_col)
-                blended_rate = max(blended_rate * platoon_mult, 0.0)
-                platoon_note = f"{bat_side}HB vs {pitch_hand}HP ({platoon_mult:.3f}x)"
-
-        if blended_rate <= 0:
-            continue
-
-        p_more = prob_over_line(blended_rate, line)
-        p_less = 1.0 - p_more
-
-        implied_p  = 0.50
-        edge_more  = p_more - implied_p
-        edge_less  = p_less - implied_p
-
-        if edge_more >= edge_less:
-            direction  = "More"
-            model_prob = p_more
-            edge       = edge_more
-        else:
-            direction  = "Less"
-            model_prob = p_less
-            edge       = edge_less
-
-        if edge <= 0:
-            continue
-
-        predictions.append({
-            "platform":      row["platform"],
-            "player_name":   player_name,
-            "player_team":   player_team,
-            "stat_type":     row["stat_type"],
-            "line":          line,
-            "direction":     direction,
-            "model_prob":    round(model_prob, 4),
-            "implied_prob":  implied_p,
-            "edge":          round(edge, 4),
-            "expected_rate": round(blended_rate, 3),
-            "season_rate":   round(season_rate, 3),
-            "recent_rate":   round(recent_rate, 3) if recent_rate is not None else None,
-            "form_source":   form_source,
-            "matchup":       matchup_note,
-            "arsenal":       arsenal_note,
-            "park":          park_note,
-            "platoon":       platoon_note,
-            "game_id":       row.get("game_id", ""),
-        })
-
-    return predictions
-
-
 if __name__ == "__main__":
     preds = predict_props()
     preds_sorted = sorted(preds, key=lambda x: x["edge"], reverse=True)
     print(f"Generated {len(preds)} predictions\n")
 
-    # Show picks where recent form differs from season (most interesting)
-    blended = [p for p in preds_sorted if p["form_source"] == "blended" and 0.55 <= p["model_prob"] <= 0.85]
-    print(f"Blended (recent+season) picks: {len(blended)}")
-    print(f"\n{'Player':<22} {'Stat':<25} {'Line':>4} {'Dir':>5} {'Model%':>7} {'Edge':>6} {'Season':>7} {'Recent':>7} {'Matchup'}")
+    print(f"{'Player':<22} {'Stat':<22} {'Line':>4} {'Dir':>5} {'Model%':>7} {'Edge':>6} {'Season':>7} {'Recent':>7} {'Matchup'}")
     print("-" * 115)
-    for p in blended[:15]:
+    for p in preds_sorted[:20]:
         recent = f"{p['recent_rate']:.2f}" if p["recent_rate"] is not None else "  N/A"
         print(
-            f"{p['player_name']:<22} {p['stat_type']:<25} {p['line']:>4} "
+            f"{p['player_name']:<22} {p['stat_type']:<22} {p['line']:>4} "
             f"{p['direction']:>5} {p['model_prob']:>6.1%} {p['edge']:>+6.1%} "
             f"{p['season_rate']:>7.2f} {recent:>7}  {p['matchup']}"
         )

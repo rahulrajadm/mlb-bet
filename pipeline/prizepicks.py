@@ -1,6 +1,10 @@
 """
 Fetches live MLB player prop lines from PrizePicks via their unofficial JSON API.
 No auth required. Lines update every few minutes.
+
+odds_type matters: "goblin" (easier line, pays less) and "demon" (harder line,
+pays more) are More-only and change the payout, so the model prices only
+"standard" lines — but everything is fetched and stored for visibility.
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -30,7 +34,10 @@ def fetch_mlb_lines() -> list[dict]:
     data = resp.json()
 
     projections = data.get("data", [])
-    included = {item["id"]: item for item in data.get("included", [])}
+    # ids are only unique within a type — keying all included items together
+    # lets a "league"/"team" item shadow a player with the same id
+    included = {item["id"]: item for item in data.get("included", [])
+                if item.get("type") == "new_player"}
 
     props = []
     for proj in projections:
@@ -47,6 +54,7 @@ def fetch_mlb_lines() -> list[dict]:
             "player_team": player_info.get("team", ""),
             "stat_type": attrs.get("stat_type", ""),
             "line": attrs.get("line_score", None),
+            "odds_type": attrs.get("odds_type", "standard") or "standard",
             "game_id": attrs.get("game_id", ""),
             "more_odds": None,  # PrizePicks uses fixed multipliers, not per-prop odds
             "less_odds": None,
@@ -61,8 +69,8 @@ def save_lines(props: list[dict]):
     for p in props:
         c.execute("""
             INSERT INTO prop_lines
-            (fetched_at, platform, game_id, player_name, player_team, stat_type, line, more_odds, less_odds)
-            VALUES (:fetched_at, :platform, :game_id, :player_name, :player_team, :stat_type, :line, :more_odds, :less_odds)
+            (fetched_at, platform, game_id, player_name, player_team, stat_type, line, odds_type, more_odds, less_odds)
+            VALUES (:fetched_at, :platform, :game_id, :player_name, :player_team, :stat_type, :line, :odds_type, :more_odds, :less_odds)
         """, p)
     conn.commit()
     conn.close()
@@ -76,6 +84,9 @@ def get_prizepicks_lines() -> list[dict]:
 
 if __name__ == "__main__":
     props = get_prizepicks_lines()
-    print(f"Fetched {len(props)} PrizePicks MLB props:")
+    by_type = {}
+    for p in props:
+        by_type[p["odds_type"]] = by_type.get(p["odds_type"], 0) + 1
+    print(f"Fetched {len(props)} PrizePicks MLB props (odds_type: {by_type}):")
     for p in props[:10]:
-        print(f"  {p['player_name']} | {p['stat_type']} | Line: {p['line']}")
+        print(f"  {p['player_name']} ({p['player_team']}) | {p['stat_type']} | Line: {p['line']} | {p['odds_type']}")

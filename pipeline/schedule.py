@@ -6,15 +6,15 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import requests
-from datetime import date
 from utils.db import get_conn
+from utils.dates import today_str
 
 MLB_API = "https://statsapi.mlb.com/api/v1"
 
 
 def fetch_today_schedule(game_date: str = None) -> list[dict]:
     if game_date is None:
-        game_date = date.today().isoformat()
+        game_date = today_str()  # Central time — UTC hosts roll over at 7pm CDT
 
     url = f"{MLB_API}/schedule"
     params = {

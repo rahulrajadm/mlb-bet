@@ -7,8 +7,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pandas as pd
 import pybaseball as pb
-from datetime import date, timedelta
+from datetime import timedelta
 from utils.db import get_conn
+from utils.dates import today_local
+from utils.names import clean_name
 
 RECENT_DAYS = 14
 MIN_PA = 10   # minimum plate appearances to trust recent batting form
@@ -16,12 +18,13 @@ MIN_IP = 3    # minimum innings pitched to trust recent pitching form
 
 
 def pull_recent_batting() -> pd.DataFrame:
-    end   = date.today()
+    end   = today_local()
     start = end - timedelta(days=RECENT_DAYS)
     print(f"  Pulling recent batting {start} → {end}...")
     df = pb.batting_stats_range(str(start), str(end))
     df = df[df["Lev"].str.startswith("Maj", na=False)].copy()
     df = df[df["PA"] >= MIN_PA].copy()
+    df["Name"] = df["Name"].map(clean_name)  # B-Ref names arrive mojibake'd
 
     df["singles"]   = df["H"] - df["2B"] - df["3B"] - df["HR"]
     df["tb"]        = df["H"] + df["2B"] + 2 * df["3B"] + 3 * df["HR"]
@@ -35,15 +38,16 @@ def pull_recent_batting() -> pd.DataFrame:
 
 
 def pull_recent_pitching() -> pd.DataFrame:
-    end   = date.today()
+    end   = today_local()
     start = end - timedelta(days=RECENT_DAYS)
     print(f"  Pulling recent pitching {start} → {end}...")
     try:
-        df = pb.pitching_stats_bref(2026)
+        df = pb.pitching_stats_range(str(start), str(end))
         df = df[df["Lev"].str.startswith("Maj", na=False)].copy() if "Lev" in df.columns else df
         df = df[pd.to_numeric(df["IP"], errors="coerce") >= MIN_IP].copy()
+        df["Name"] = df["Name"].map(clean_name)
         df["k_per_9"]  = pd.to_numeric(df["SO"], errors="coerce") / pd.to_numeric(df["IP"], errors="coerce") * 9
-        df["k_per_gs"] = pd.to_numeric(df["SO"], errors="coerce") / df["GS"].replace(0, pd.NA)
+        df["k_per_gs"] = pd.to_numeric(df["SO"], errors="coerce") / pd.to_numeric(df["GS"], errors="coerce").replace(0, pd.NA)
         return df[["Name", "G", "GS", "IP", "SO", "ERA", "WHIP", "k_per_9", "k_per_gs"]]
     except Exception as e:
         print(f"  Warning: {e}")

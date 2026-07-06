@@ -1,6 +1,8 @@
 """
-Pulls 3 seasons of historical MLB game logs and Statcast batting/pitching data
-via pybaseball and stores in SQLite. Run once to seed the database.
+Pulls recent seasons of MLB player stats and Statcast quality data via
+pybaseball and stores them in SQLite. Run to (re)seed the database — tables
+are rebuilt from scratch, so re-running mid-season refreshes the current
+season's partial data.
 """
 import sys
 import os
@@ -9,55 +11,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pandas as pd
 import pybaseball as pb
 from utils.db import get_conn, init_db
+from utils.dates import today_local
 
-SEASONS = [2022, 2023, 2024]
+SEASONS = [2024, 2025, 2026]
 
 
-def pull_game_logs():
-    conn = get_conn()
-    print("Pulling historical game logs...")
-
-    for season in SEASONS:
-        print(f"  Season {season}...")
-        try:
-            schedule = pb.schedule_and_record(season, "NYY")
-            # Use team_game_logs for each team instead — build from Retrosheet
-            pass
-        except Exception:
-            pass
-
-    # Use pybaseball's team batting/pitching logs via Lahman or fg_team
-    try:
-        for season in SEASONS:
-            print(f"  Fetching batting stats {season}...")
-            batting = pb.batting_stats(season, qual=50)
-            batting["season"] = season
-            batting.to_sql("batting_season", conn, if_exists="append", index=False)
-
-            print(f"  Fetching pitching stats {season}...")
-            pitching = pb.pitching_stats(season, qual=30)
-            pitching["season"] = season
-            pitching.to_sql("pitching_season", conn, if_exists="append", index=False)
-    except Exception as e:
-        print(f"  Warning: {e}")
-
-    conn.commit()
-    conn.close()
+def _season_range(season: int) -> tuple[str, str]:
+    """Opening day-ish through season end, clamped to today for the
+    in-progress season."""
+    start = f"{season}-03-20"
+    end = f"{season}-10-01"
+    today = today_local()
+    if season == today.year:
+        end = min(pd.Timestamp(end).date(), today).isoformat()
+    return start, end
 
 
 def pull_statcast_batters():
     conn = get_conn()
     print("Pulling Statcast batter data...")
-
+    frames = []
     for season in SEASONS:
         print(f"  Statcast batters {season}...")
         try:
             df = pb.statcast_batter_exitvelo_barrels(season, minBBE=50)
             df["season"] = season
-            df.to_sql("statcast_batters", conn, if_exists="append", index=False)
+            frames.append(df)
         except Exception as e:
             print(f"  Warning: {e}")
-
+    if frames:
+        pd.concat(frames).to_sql("statcast_batters", conn, if_exists="replace", index=False)
     conn.commit()
     conn.close()
 
@@ -65,54 +48,43 @@ def pull_statcast_batters():
 def pull_statcast_pitchers():
     conn = get_conn()
     print("Pulling Statcast pitcher data...")
-
+    frames = []
     for season in SEASONS:
         print(f"  Statcast pitchers {season}...")
         try:
             df = pb.statcast_pitcher_exitvelo_barrels(season, minBBE=50)
             df["season"] = season
-            df.to_sql("statcast_pitchers", conn, if_exists="append", index=False)
+            frames.append(df)
         except Exception as e:
             print(f"  Warning: {e}")
-
-    # Pitcher strikeout/walk rates
-    for season in SEASONS:
-        print(f"  Pitcher K/BB rates {season}...")
-        try:
-            df = pb.pitching_stats(season, qual=30)
-            df["season"] = season
-            df[["Name", "Team", "season", "SO", "BB", "IP", "ERA", "FIP", "xFIP",
-                "K/9", "BB/9", "K%", "BB%", "WHIP", "GB%", "HR/9"]].to_sql(
-                "pitcher_rates", conn, if_exists="append", index=False
-            )
-        except Exception as e:
-            print(f"  Warning: {e}")
-
+    if frames:
+        pd.concat(frames).to_sql("statcast_pitchers", conn, if_exists="replace", index=False)
     conn.commit()
     conn.close()
 
 
 def pull_player_game_logs():
-    """Pull individual batter game logs for prop model training."""
+    """Per-player season aggregates (B-Ref range stats) for profile building."""
     conn = get_conn()
-    print("Pulling batter game logs (this may take a few minutes)...")
-
-    try:
-        for season in SEASONS:
-            print(f"  Batter game logs {season}...")
-            df = pb.batting_stats_range(f"{season}-03-28", f"{season}-10-01")
+    print("Pulling batter season stats (this may take a few minutes)...")
+    frames = []
+    for season in SEASONS:
+        start, end = _season_range(season)
+        print(f"  Batter stats {season} ({start} → {end})...")
+        try:
+            df = pb.batting_stats_range(start, end)
             df["season"] = season
-            df.to_sql("batter_game_logs", conn, if_exists="append", index=False)
-    except Exception as e:
-        print(f"  Warning: {e}")
-
+            frames.append(df)
+        except Exception as e:
+            print(f"  Warning: {e}")
+    if frames:
+        pd.concat(frames).to_sql("batter_game_logs", conn, if_exists="replace", index=False)
     conn.commit()
     conn.close()
 
 
 if __name__ == "__main__":
     init_db()
-    pull_game_logs()
     pull_statcast_batters()
     pull_statcast_pitchers()
     pull_player_game_logs()

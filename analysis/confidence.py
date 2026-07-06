@@ -1,24 +1,25 @@
 """
-Assigns confidence tier to each pick based on edge size and edge reliability.
-For V1, tiers are edge-based. Future: calibrate against historical hit rates.
+Assigns confidence tier to each pick based on edge size and sample size.
+Edges here are measured against the pick'em break-even (~0.577), so
+thresholds follow the original design doc: STRONG >12%, HIGH 8–12%,
+MEDIUM 4–8%, LOW below.
 """
 
 
 def get_confidence_tier(edge: float, games_sample: int = 0) -> str:
     """
-    edge: model_prob - implied_prob (0.0–1.0)
-    games_sample: number of games in the player's historical sample
+    edge: model_prob − break-even (0.0–1.0)
+    games_sample: games in the player's historical sample (profiles carry
+    this; pitcher props pass starts)
     """
-    # Penalize small samples
     sample_penalty = 0.03 if games_sample < 50 else 0.0
-
     adj_edge = edge - sample_penalty
 
-    if adj_edge >= 0.15:
+    if adj_edge >= 0.12:
         return "STRONG"
-    elif adj_edge >= 0.10:
+    elif adj_edge >= 0.08:
         return "HIGH"
-    elif adj_edge >= 0.05:
+    elif adj_edge >= 0.04:
         return "MEDIUM"
     else:
         return "LOW"
