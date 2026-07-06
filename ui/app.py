@@ -10,11 +10,14 @@ import pandas as pd
 from datetime import datetime, timezone
 
 from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest, line_type_rows
+from models.game_model import predict_games, best_game_edges
 from pipeline.schedule import get_today_games
 from pipeline.prizepicks import get_prizepicks_lines
 from pipeline.underdog import get_underdog_lines
 from pipeline.recent_form import get_recent_form
 from pipeline.pitcher_stats import get_pitcher_stats
+from pipeline.team_stats import get_team_stats
+from pipeline.odds_api import get_all_odds
 from pipeline.lineups import lineups_are_posted
 from pipeline.handedness import fetch_and_save_pitcher_hands, fetch_lineup_handedness
 from pipeline.team_names import to_abbr, to_full_name
@@ -87,12 +90,31 @@ with st.sidebar:
             get_pitcher_stats()
             fetch_and_save_pitcher_hands()
             try:
+                get_team_stats()   # free MLB StatsAPI team run rates (game model)
+            except Exception:
+                pass
+            try:
                 fetch_lineup_handedness()
             except Exception:
                 pass
         st.cache_data.clear()
         st.success("Data refreshed!")
         st.rerun()
+
+    # Game odds are the only metered source (~3 API credits per fetch), so
+    # keep them behind their own explicit button — never the main refresh.
+    if st.button("🎲 Refresh game odds (~3 API credits)", width="stretch"):
+        with st.spinner("Fetching sportsbook odds…"):
+            try:
+                get_all_odds()
+                st.session_state["_odds_ok"] = True
+            except Exception as e:
+                st.session_state["_odds_ok"] = False
+                st.session_state["_odds_err"] = str(e)
+        st.cache_data.clear()
+        st.rerun()
+    if st.session_state.get("_odds_ok"):
+        st.caption("✅ Game odds loaded")
 
     # Lineup status indicator
     try:
@@ -137,6 +159,10 @@ def load_alt_lines(alt_types):
     return line_type_rows(alt_types) if alt_types else []
 
 @st.cache_data(ttl=300)
+def load_game_preds():
+    return predict_games()
+
+@st.cache_data(ttl=300)
 def load_games():
     return get_today_games()
 
@@ -144,6 +170,8 @@ with st.spinner("Loading picks…"):
     all_picks = load_picks(bankroll, unit_size)
     games = load_games()
     alt_rows = load_alt_lines(alt_odds_types)
+    game_preds = load_game_preds()
+    game_pred_by_id = {str(gm["game_id"]): gm for gm in game_preds}
 
 # Apply sidebar filters
 if platforms:
@@ -160,6 +188,25 @@ high_interest = best_picks_per_player(hi_pool)
 comparison = platform_comparison(hi_pool)
 
 ALT_BADGE = {"goblin": "🟢 Goblin", "demon": "🔴 Demon"}
+
+def render_game_markets(gm):
+    """One game's model markets (moneyline / run line / totals) with book
+    edges where odds are loaded."""
+    st.markdown(
+        f"**Model projection:** {gm['away_team']} **{gm['e_away']}** — "
+        f"**{gm['e_home']}** {gm['home_team']}  ·  total **{gm['proj_total']}**"
+    )
+    st.dataframe(pd.DataFrame([{
+        "Market":    m["market"],
+        "Selection": m["side"],
+        "Model %":   f"{m['model_prob']:.1%}",
+        "Book %":    f"{m['book_prob']:.1%}" if m["book_prob"] is not None else "—",
+        "Edge":      f"{m['edge']:+.1%}"     if m["edge"] is not None else "—",
+        "EV/100":    f"{m['ev_100']:+.1f}"   if m["ev_100"] is not None else "—",
+    } for m in gm["markets"]]), width="stretch", hide_index=True)
+    if not gm["has_odds"]:
+        st.caption("Model projection only — no book odds loaded. Use "
+                   "“🎲 Refresh game odds” in the sidebar to price edges.")
 
 def render_player_props(std_comparison, alt_view, search):
     """Player Props tab body: standard priced picks plus view-only
@@ -321,6 +368,22 @@ with tab2:
 with tab3:
     timestamp_bar()
     st.header("Today's Games")
+    st.caption("Game markets (moneyline · run line · totals) from a team "
+               "run-expectation model. Load book odds in the sidebar to price edges.")
+
+    game_edges = best_game_edges(game_preds)
+    if game_edges:
+        st.markdown("**🎯 Top game-market edges today:**")
+        st.dataframe(pd.DataFrame([{
+            "Game":    b["matchup"],
+            "Market":  b["market"],
+            "Pick":    b["side"],
+            "Model %": f"{b['model_prob']:.1%}",
+            "Book %":  f"{b['book_prob']:.1%}",
+            "Edge":    f"{b['edge']:+.1%}",
+            "EV/100":  f"{b['ev_100']:+.1f}",
+        } for b in game_edges[:12]]), width="stretch", hide_index=True)
+        st.divider()
 
     if not games:
         st.info("No games found for today. Try refreshing.")
@@ -334,6 +397,11 @@ with tab3:
                 col1.markdown(f"**Away:** {g['away_team']}  \n**Starter:** {g['away_starter']}")
                 col2.markdown(f"**Home:** {g['home_team']}  \n**Starter:** {g['home_starter']}")
                 col3.markdown(f"**Venue:** {g.get('venue', 'N/A')}")
+
+                gm = game_pred_by_id.get(str(g.get("game_id", "")))
+                if gm:
+                    render_game_markets(gm)
+                st.divider()
 
                 game_teams = {g["home_team"], g["away_team"]}
                 game_picks = [p for p in high_interest

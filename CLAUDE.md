@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MLB player-prop pick'em tool: a 5-layer heuristic prediction (recency-weighted season profiles → 14-day form blend → opposing-pitcher matchup + arsenal → park factor → platoon split) feeds a Poisson distribution to get P(stat > line) for live PrizePicks/Underdog lines, then surfaces +EV picks with confidence tiers, risk profiles, and quarter-Kelly stakes. Deployed at https://bet-mlb.streamlit.app.
 
-There are **no trained ML models**: `data/models/*.pkl` are joblib-pickled pandas DataFrames of per-game rates (season-weighted 2024/25/26 at 0.15/0.30/0.55). There are also no game-outcome predictions — the "Game Predictions" tab shows the schedule plus that game's player-prop picks. `plan.md` is the original design doc; large parts of it (moneyline/totals models, Fliff, DK Pick6, Polymarket) were never built.
+There are **no trained ML models**: `data/models/*.pkl` are joblib-pickled pandas DataFrames of per-game rates (season-weighted 2024/25/26 at 0.15/0.30/0.55). Game-outcome markets (moneyline / run line / totals) are a **heuristic** team run-expectation model (`models/game_model.py`, added 2026-07-06) — not trained ML — surfaced in the "Game Predictions" tab alongside the schedule and that game's player-prop picks. First-inning (NRFI) and first-5 markets were intentionally left out (no free data source). `plan.md` is the original design doc; other parts of it (Fliff, DK Pick6, Polymarket) were never built.
 
 ## Commands
 
@@ -45,7 +45,7 @@ Deployment = push to `main`; Streamlit Cloud auto-redeploys. Secrets on cloud: `
 
 ## Data sources and costs
 
-- **The Odds API** (`ODDS_API_KEY` in `.env`): the **only metered source** (~500 free credits/month). Touched only by `pipeline/odds_api.py` — one `get_all_odds()` = 3 requests. **Nothing in the app calls it anymore** (the odds it saves were never consumed); it's kept as a standalone script for future game-market work. **Never trigger it without asking the user first.**
+- **The Odds API** (`ODDS_API_KEY` in `.env`): the **only metered source** (~500 free credits/month). Touched only by `pipeline/odds_api.py` — one `get_all_odds()` = 3 requests (h2h/spreads/totals). Now consumed by the game-markets model to price book edges: **locally** behind an explicit sidebar "Refresh game odds (~3 API credits)" button (never the main refresh); **on cloud** inside `load_all_data()` only if `ODDS_API_KEY` is set in `st.secrets`, so it fires at most once per passcode refresh (never per visitor) — without the secret the cloud game markets show model projections only. game_odds rows share one `fetched_at` per batch, and runline rows store the home spread point (−1.5/+1.5) in `total_line` so the two sides pair to the right book price. **Still never trigger `get_all_odds()` from a script without asking the user first.**
 - **PrizePicks / Underdog**: free unofficial JSON endpoints, no auth. Underdog team UUIDs are resolved to abbreviations via `stats.underdogfantasy.com/v1/teams` at fetch time.
 - **MLB Stats API** (`statsapi.mlb.com`): schedule, probable starters, confirmed lineups, handedness. Official, free, no key.
 - **pybaseball** (Baseball-Reference / Statcast scrapes): seeding, 14-day recent form, season pitcher stats, arsenal whiff rates. Free but rate-limited scraping — slow, and **B-Ref names arrive mojibake'd** (see name matching below).

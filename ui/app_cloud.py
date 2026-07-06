@@ -18,7 +18,10 @@ from pipeline.pitcher_arsenal import pull_arsenal_stats, compute_weighted_whiff
 from pipeline.handedness import fetch_lineup_handedness
 from pipeline.lineups import get_confirmed_players
 from pipeline.team_names import to_abbr, to_full_name
+from pipeline.team_stats import fetch_team_stats
+from pipeline.odds_api import fetch_all_odds_rows
 from picks.engine import build_picks, best_picks_per_player, platform_comparison, is_high_interest, line_type_rows
+from models.game_model import predict_games, best_game_edges
 from analysis.confidence import TIER_RANK
 from analysis.ev import ev_slip
 from utils.dates import APP_TZ
@@ -68,6 +71,25 @@ def load_all_data():
     except Exception:
         confirmed = set()
 
+    # Team run rates for the game model (free MLB StatsAPI)
+    try:
+        team_stats = fetch_team_stats()
+    except Exception:
+        team_stats = {}
+
+    # Game odds are metered (The Odds API): only fetch if a key is configured
+    # in secrets, and only here (refresh is passcode-gated, never per-visitor).
+    game_odds = []
+    try:
+        odds_key = st.secrets.get("ODDS_API_KEY")
+    except Exception:
+        odds_key = None
+    if odds_key:
+        try:
+            game_odds = fetch_all_odds_rows(odds_key)
+        except Exception:
+            game_odds = []
+
     # Combine all prop lines
     all_lines = []
     for p in pp_lines + ud_lines:
@@ -83,6 +105,8 @@ def load_all_data():
         "arsenal":   arsenal,
         "hand_db":   hand_db,
         "confirmed": confirmed,
+        "team_stats": team_stats,
+        "game_odds":  game_odds,
         "fetched_at": datetime.now(APP_TZ).strftime("%b %d %Y, %I:%M %p"),
     }
 
@@ -198,12 +222,41 @@ def load_alt_lines_cloud(alt_types, cache_key):
         arsenal_data=data["arsenal"],
     )
 
+@st.cache_data(show_spinner=False)
+def load_game_preds_cloud(cache_key):
+    return predict_games(
+        games_data=data["games"],
+        team_stats_data=data.get("team_stats"),
+        pitcher_stats_data=data["pit_stats"],
+        odds_data=data.get("game_odds") or None,
+    )
+
 filtered = load_picks_cloud(bankroll, unit_size, min_conf, tuple(platforms), data["fetched_at"])
 hi_pool  = [p for p in filtered if is_high_interest(p)]
 best     = best_picks_per_player(filtered)
 hi       = best_picks_per_player(hi_pool)
 comp     = platform_comparison(hi_pool)
 alt_rows = load_alt_lines_cloud(alt_odds_types, data["fetched_at"])
+game_preds      = load_game_preds_cloud(data["fetched_at"])
+game_pred_by_id = {str(gm["game_id"]): gm for gm in game_preds}
+
+def render_game_markets(gm):
+    """One game's model markets (moneyline / run line / totals) with book
+    edges where odds are loaded."""
+    st.markdown(
+        f"**Model projection:** {gm['away_team']} **{gm['e_away']}** — "
+        f"**{gm['e_home']}** {gm['home_team']}  ·  total **{gm['proj_total']}**"
+    )
+    st.dataframe(pd.DataFrame([{
+        "Market":    m["market"], "Selection": m["side"],
+        "Model %":   f"{m['model_prob']:.1%}",
+        "Book %":    f"{m['book_prob']:.1%}" if m["book_prob"] is not None else "—",
+        "Edge":      f"{m['edge']:+.1%}"     if m["edge"] is not None else "—",
+        "EV/100":    f"{m['ev_100']:+.1f}"   if m["ev_100"] is not None else "—",
+    } for m in gm["markets"]]), width="stretch", hide_index=True)
+    if not gm["has_odds"]:
+        st.caption("Model projection only — book odds unavailable "
+                   "(set ODDS_API_KEY in secrets to price edges).")
 
 def render_player_props(std_comparison, alt_view, search):
     """Player Props tab body: standard priced picks plus view-only
@@ -355,6 +408,19 @@ with tab2:
 with tab3:
     timestamp_bar(data["fetched_at"])
     st.header("Today's Games")
+    st.caption("Game markets (moneyline · run line · totals) from a team "
+               "run-expectation model. Book edges show when odds are loaded.")
+
+    game_edges = best_game_edges(game_preds)
+    if game_edges:
+        st.markdown("**🎯 Top game-market edges today:**")
+        st.dataframe(pd.DataFrame([{
+            "Game": b["matchup"], "Market": b["market"], "Pick": b["side"],
+            "Model %": f"{b['model_prob']:.1%}", "Book %": f"{b['book_prob']:.1%}",
+            "Edge": f"{b['edge']:+.1%}", "EV/100": f"{b['ev_100']:+.1f}",
+        } for b in game_edges[:12]]), width="stretch", hide_index=True)
+        st.divider()
+
     if not games_list:
         st.info("No games found for today.")
     else:
@@ -367,6 +433,12 @@ with tab3:
                 c1.markdown(f"**Away:** {g['away_team']}  \n**Starter:** {g['away_starter']}")
                 c2.markdown(f"**Home:** {g['home_team']}  \n**Starter:** {g['home_starter']}")
                 c3.markdown(f"**Venue:** {g.get('venue', 'N/A')}")
+
+                gm = game_pred_by_id.get(str(g.get("game_id", "")))
+                if gm:
+                    render_game_markets(gm)
+                st.divider()
+
                 game_teams = {g["home_team"], g["away_team"]}
                 game_picks = [p for p in hi if to_full_name(p.get("player_team", "")) in game_teams]
                 if game_picks:
