@@ -38,12 +38,26 @@ def fetch_odds(market: str, api_key: str | None = None) -> list[dict]:
 _MARKET_NAME = {"h2h": "moneyline", "spreads": "runline", "totals": "totals"}
 
 
+def is_pregame(game: dict) -> bool:
+    """True unless the game has already started. In-progress games carry live
+    odds that would wreck edges against a pre-game model, so we drop them."""
+    ct = game.get("commence_time")
+    if not ct:
+        return True
+    try:
+        return datetime.fromisoformat(ct.replace("Z", "+00:00")) > datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+
 def _rows_from_games(games: list[dict], market: str) -> list[dict]:
     """Normalize one market's API payload to game_odds row dicts (in-memory,
     no DB writes) — the same shape predict_games/_consensus expect."""
     name = _MARKET_NAME[market]
     rows = []
     for game in games:
+        if not is_pregame(game):
+            continue
         home, away = game.get("home_team"), game.get("away_team")
         for bk in game.get("bookmakers", []):
             for mkt in bk.get("markets", []):
@@ -82,6 +96,8 @@ def parse_and_save(games: list[dict], market: str, fetched_at: str | None = None
     fetched_at = fetched_at or datetime.now(timezone.utc).isoformat()
 
     for game in games:
+        if not is_pregame(game):
+            continue
         game_id = game["id"]
         home_team = game["home_team"]
         away_team = game["away_team"]

@@ -34,34 +34,27 @@ LEAGUE_AVG_ERA = 4.20
 STARTER_WEIGHT = 0.35   # today's starter only nudges the team RA (already
                         # reflects their pitching) — dampened to avoid double count
 MIN_GAME_EDGE  = 0.03   # surface a market only if |model − book| clears this
+MAX_GAME_EDGE  = 0.30   # no book misprices a game market by 30%+ — beyond this
+                        # the book price is stale/mismatched, so drop the edge
+                        # (show model + book %, but no misleading edge/EV)
 
 
 # ── American-odds helpers ───────────────────────────────────────────────────────
 
-def american_to_prob(odds: float) -> float:
+def american_to_decimal(odds: float) -> float:
+    """American → decimal odds. Decimal odds ARE averageable across books;
+    American odds are NOT (they jump discontinuously across ±100, so a naive
+    mean of −102 and +103 collapses to a nonsensical ~0)."""
     if odds is None:
         return None
     odds = float(odds)
-    return (-odds) / (-odds + 100) if odds < 0 else 100 / (odds + 100)
+    return 1 + odds / 100.0 if odds > 0 else 1 + 100.0 / (-odds)
 
 
-def american_profit(odds: float, stake: float = 100.0) -> float:
-    """Profit on a winning `stake` bet at these American odds."""
-    odds = float(odds)
-    return stake * (odds / 100.0) if odds > 0 else stake * (100.0 / -odds)
-
-
-def ev_per_100(model_prob: float, odds: float) -> float:
-    """Expected value of a $100 bet at the book's price given the model prob."""
-    profit = american_profit(odds, 100.0)
+def ev_per_100_decimal(model_prob: float, decimal_odds: float) -> float:
+    """Expected value of a $100 bet at these decimal odds given the model prob."""
+    profit = (decimal_odds - 1.0) * 100.0
     return model_prob * profit - (1 - model_prob) * 100.0
-
-
-def _devig(prob_a: float, prob_b: float) -> tuple[float, float]:
-    total = (prob_a or 0) + (prob_b or 0)
-    if total <= 0:
-        return None, None
-    return prob_a / total, prob_b / total
 
 
 # ── Run expectation + pricing ───────────────────────────────────────────────────
@@ -134,22 +127,23 @@ def _consensus(odds_df: pd.DataFrame, home_full: str, away_full: str) -> dict:
                 (odds_df["platform"] != "polymarket")]
     if g.empty:
         return {}
+    # All consensus prices are stored as mean DECIMAL odds (averageable).
     out = {}
     ml = g[g["market"] == "moneyline"]
     if not ml.empty:
-        out["ml_home"] = ml["home_odds"].dropna().mean()
-        out["ml_away"] = ml["away_odds"].dropna().mean()
+        out["ml_home"] = _mean_decimal(ml["home_odds"])
+        out["ml_away"] = _mean_decimal(ml["away_odds"])
     # Run line: pair each book's price to the HOME point it was posted at.
     # total_line holds that point, so home −1.5 and home +1.5 never blend.
     rl = g[g["market"] == "runline"]
     rl_minus = rl[rl["total_line"] == -1.5]   # home −1.5 (away +1.5)
     rl_plus  = rl[rl["total_line"] == 1.5]     # home +1.5 (away −1.5)
     if not rl_minus.empty:
-        out["rl_home_minus15"] = rl_minus["home_odds"].dropna().mean()
-        out["rl_away_plus15"]  = rl_minus["away_odds"].dropna().mean()
+        out["rl_home_minus15"] = _mean_decimal(rl_minus["home_odds"])
+        out["rl_away_plus15"]  = _mean_decimal(rl_minus["away_odds"])
     if not rl_plus.empty:
-        out["rl_home_plus15"]  = rl_plus["home_odds"].dropna().mean()
-        out["rl_away_minus15"] = rl_plus["away_odds"].dropna().mean()
+        out["rl_home_plus15"]  = _mean_decimal(rl_plus["home_odds"])
+        out["rl_away_minus15"] = _mean_decimal(rl_plus["away_odds"])
     tot = g[g["market"] == "totals"].dropna(subset=["total_line"])
     if not tot.empty:
         # Books post different totals (8.0 vs 8.5); price the modal line and
@@ -157,23 +151,32 @@ def _consensus(odds_df: pd.DataFrame, home_full: str, away_full: str) -> dict:
         line = tot["total_line"].mode().iloc[0]
         at_line = tot[tot["total_line"] == line]
         out["total_line"] = float(line)
-        out["over_odds"]  = at_line["over_odds"].dropna().mean()
-        out["under_odds"] = at_line["under_odds"].dropna().mean()
+        out["over_odds"]  = _mean_decimal(at_line["over_odds"])
+        out["under_odds"] = _mean_decimal(at_line["under_odds"])
     return out
 
 
-def _market(name, side, line, model_prob, book_odds, opp_book_odds):
-    """Assemble one market row, de-vigging the book price against its opposite
-    side. edge/EV are None when no odds are available (projection only)."""
+def _mean_decimal(series) -> float | None:
+    vals = [american_to_decimal(o) for o in series.dropna()]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _market(name, side, line, model_prob, dec, opp_dec):
+    """Assemble one market row from consensus DECIMAL odds. De-vigs against the
+    opposite side for a fair book prob; edge/EV are None with no odds. An edge
+    beyond MAX_GAME_EDGE means a stale/mismatched price, not value — drop it."""
     row = {"market": name, "side": side, "line": line,
-           "model_prob": round(model_prob, 4),
-           "book_prob": None, "book_odds": book_odds, "edge": None, "ev_100": None}
-    if book_odds is not None and opp_book_odds is not None:
-        fair, _ = _devig(american_to_prob(book_odds), american_to_prob(opp_book_odds))
-        if fair is not None:
-            row["book_prob"] = round(fair, 4)
-            row["edge"]      = round(model_prob - fair, 4)
-            row["ev_100"]    = round(ev_per_100(model_prob, book_odds), 1)
+           "model_prob": round(model_prob, 4), "book_prob": None,
+           "book_dec": round(dec, 3) if dec else None, "edge": None, "ev_100": None}
+    if dec and opp_dec:
+        imp, opp_imp = 1.0 / dec, 1.0 / opp_dec
+        fair = imp / (imp + opp_imp)
+        row["book_prob"] = round(fair, 4)
+        edge = model_prob - fair
+        if abs(edge) <= MAX_GAME_EDGE:
+            row["edge"]   = round(edge, 4)
+            row["ev_100"] = round(ev_per_100_decimal(model_prob, dec), 1)
     return row
 
 
