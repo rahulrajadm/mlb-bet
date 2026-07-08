@@ -16,10 +16,24 @@ from utils.db import get_conn
 PRIZEPICKS_URL = "https://api.prizepicks.com/projections"
 MLB_LEAGUE_ID = 2  # MLB league ID on PrizePicks
 
+# PrizePicks is fronted by DataDome bot protection, which returns a 403 with a
+# captcha-delivery.com interstitial when it doesn't trust the caller (datacenter
+# IPs like Streamlit Cloud are challenged aggressively). A full browser-like
+# header set is more legitimate but does NOT defeat DataDome — that needs a real
+# browser to solve the challenge and mint a `datadome` cookie. So this is
+# best-effort only; callers MUST degrade gracefully when the fetch 403s.
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://app.prizepicks.com",
     "Referer": "https://app.prizepicks.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
 
 

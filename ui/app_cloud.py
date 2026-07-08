@@ -46,8 +46,22 @@ EDGE_HELP = (
 def load_all_data():
     """Fetch all live data in-memory. Cached until a passcode refresh."""
     games       = fetch_today_schedule()
-    pp_lines    = pp_fetch()
-    ud_lines    = ud_fetch()
+
+    # Prop-line sources are independently guarded: PrizePicks sits behind
+    # Cloudflare and periodically 403s cloud IPs, but Underdog lines (and the
+    # rest of the app) are still fully usable, so one source failing must not
+    # take down load_all_data().
+    try:
+        pp_lines = pp_fetch()
+    except Exception as e:
+        print(f"[app_cloud] PrizePicks fetch failed: {e}", file=sys.stderr)
+        pp_lines = []
+    try:
+        ud_lines = ud_fetch()
+    except Exception as e:
+        print(f"[app_cloud] Underdog fetch failed: {e}", file=sys.stderr)
+        ud_lines = []
+
     rec_bat     = pull_recent_batting()
     rec_pit     = pull_recent_pitching()
     pit_stats   = blend_pitcher_stats(pull_pitcher_stats(), pull_recent_pitcher_form())
@@ -107,6 +121,8 @@ def load_all_data():
         "confirmed": confirmed,
         "team_stats": team_stats,
         "game_odds":  game_odds,
+        "pp_count":   len(pp_lines),
+        "ud_count":   len(ud_lines),
         "fetched_at": datetime.now(APP_TZ).strftime("%b %d %Y, %I:%M %p"),
     }
 
@@ -171,6 +187,12 @@ with st.sidebar:
         st.warning("⏳ Lineups not posted yet")
     st.caption(f"🕐 Last updated: **{data['fetched_at']}** CT")
     st.caption("Data: PrizePicks · Underdog · MLB Stats API")
+    if data["pp_count"] == 0 and "prizepicks" in platforms:
+        st.warning("⚠️ PrizePicks lines unavailable (their bot protection is "
+                   "blocking the server). Showing Underdog lines only.")
+    elif data["ud_count"] == 0 and "underdog" in platforms:
+        st.warning("⚠️ Underdog lines unavailable right now. "
+                   "Showing PrizePicks lines only.")
 
 # Timestamp banner — shown at top of every tab
 def timestamp_bar(fetched_at: str):
